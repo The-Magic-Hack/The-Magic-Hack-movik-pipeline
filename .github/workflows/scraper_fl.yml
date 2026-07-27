@@ -1,0 +1,95 @@
+name: Scraper FL
+
+# Manual por ahora. Cuando el backfill esté completo, agregar:
+#   schedule:
+#     - cron: "0 7 * * *"
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Correr solo N carriers (vacío = todos)"
+        required: false
+        default: ""
+      retry_errors:
+        description: "Reintentar los carriers que quedaron en error"
+        type: boolean
+        default: false
+      tables:
+        description: "Tablas a recargar en Supabase"
+        type: choice
+        default: "ucc_filings maestro"
+        options:
+          - "ucc_filings maestro"
+          - "carriers ucc_filings maestro"
+
+concurrency:
+  # Dos runs a la vez se pisarían el movik.db y el checkpoint.
+  group: scraper-fl
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Tope de GitHub Actions: 6 h. El scraper guarda checkpoint, así que un run
+    # cortado se retoma donde quedó en el siguiente.
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install supabase
+
+      # movik.db no vive en el repo (168 MB): viaja como artifact de un run al
+      # siguiente. El primer run no encuentra nada y arranca de cero — para ese
+      # caso hay que subir un movik.db semilla con el censo ya cargado.
+      - name: Recuperar movik.db del run anterior
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PREV=$(gh run list --workflow=scraper_fl.yml --status=success \
+                   --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$PREV" ]; then
+            echo "::warning::Sin run previo exitoso; no hay movik.db que restaurar."
+            exit 0
+          fi
+          echo "Restaurando estado del run $PREV"
+          gh run download "$PREV" --name movik-state-fl --dir . || \
+            echo "::warning::El run $PREV no dejó artifact movik-state-fl."
+          ls -lh movik.db scraper_checkpoint.json 2>/dev/null || true
+
+      - name: Correr scraper FL
+        run: |
+          ARGS="--states FL"
+          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --test ${{ inputs.limit }}"; fi
+          if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
+          echo "python ucc_scraper.py $ARGS"
+          python -u ucc_scraper.py $ARGS
+
+      # Se guarda aunque el scraper falle a mitad: el checkpoint y las filas ya
+      # escritas valen igual, y perderlos obligaría a re-scrapear todo.
+      - name: Guardar movik.db + checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: movik-state-fl
+          path: |
+            movik.db
+            scraper_checkpoint.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Cargar a Supabase (schema movik)
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python -u load_to_supabase.py --only ${{ inputs.tables }}

@@ -1,0 +1,95 @@
+name: Scraper CA
+
+# Manual por ahora. Cuando el backfill esté completo, agregar:
+#   schedule:
+#     - cron: "0 9 * * *"
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Correr solo N carriers (vacío = todos)"
+        required: false
+        default: ""
+      retry_errors:
+        description: "Reintentar los carriers que quedaron en error"
+        type: boolean
+        default: false
+      workers:
+        description: "Peticiones en paralelo (vacío = default del scraper)"
+        required: false
+        default: ""
+      tables:
+        description: "Tablas a recargar en Supabase"
+        type: choice
+        default: "ucc_filings maestro"
+        options:
+          - "ucc_filings maestro"
+          - "carriers ucc_filings maestro"
+
+concurrency:
+  group: scraper-ca
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install supabase
+
+      - name: Recuperar movik.db del run anterior
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PREV=$(gh run list --workflow=scraper_ca.yml --status=success \
+                   --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$PREV" ]; then
+            echo "::warning::Sin run previo exitoso; no hay movik.db que restaurar."
+            exit 0
+          fi
+          echo "Restaurando estado del run $PREV"
+          gh run download "$PREV" --name movik-state-ca --dir . || \
+            echo "::warning::El run $PREV no dejó artifact movik-state-ca."
+          ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
+
+      # ca_ucc_scraper.py NO acepta --state: es CA-only por diseño (pega contra
+      # bizfileonline.sos.ca.gov). Sus flags son --test/--retry-errors/--reset/
+      # --rate/--workers/--alerts-only.
+      - name: Correr scraper CA
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --test ${{ inputs.limit }}"; fi
+          if [ -n "${{ inputs.workers }}" ]; then ARGS="$ARGS --workers ${{ inputs.workers }}"; fi
+          if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
+          echo "python ca_ucc_scraper.py $ARGS"
+          python -u ca_ucc_scraper.py $ARGS
+
+      - name: Guardar movik.db + checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: movik-state-ca
+          path: |
+            movik.db
+            ca_scraper_checkpoint.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Cargar a Supabase (schema movik)
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python -u load_to_supabase.py --only ${{ inputs.tables }}

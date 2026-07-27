@@ -1,0 +1,26 @@
+# ── Datos pesados: viajan como artifact de GitHub Actions, no por git ──────
+census_file_full.csv
+movik.db
+*.xlsx
+*.csv
+*.log
+movik_admin_data.json
+
+# ── Estado del scraper ─────────────────────────────────────────────────────
+scraper_checkpoint.json
+ca_scraper_checkpoint.json
+census_state.json
+checkpoint.txt
+
+# ── Entorno ────────────────────────────────────────────────────────────────
+__pycache__/
+.venv/
+.env
+.claude/
+.vscode/
+
+# ── Scratch ────────────────────────────────────────────────────────────────
+temp_*.py
+
+# ── La webapp vive en su propio repo (The-Magic-Hack/DemoMovik) ────────────
+Movikapp/
