@@ -219,6 +219,36 @@ def init_schema(conn):
     print(f"   ✅ schema {SCHEMA}: " + ", ".join(f"{n}" for n, _ in objs))
 
 
+# Vistas materializadas de agregados. Se recalculan solo aquí: sus datos no
+# cambian entre cargas, y dejarlas como vistas normales metía hasta 3 s en cada
+# pantalla de reportes de la app.
+MATVIEWS = [
+    "mv_priority_counts", "mv_state_counts",
+    "mv_top_parties", "mv_secured_parties", "mv_scraper_status",
+]
+
+
+def finalize(conn, tables: list[str]):
+    """ANALYZE + REFRESH tras cargar. Sin esto el planner sigue creyendo que
+    las tablas están vacías y elige seq scans donde hay índice."""
+    print("\n🔧 Actualizando estadísticas y agregados...")
+    prev_autocommit = conn.autocommit
+    conn.commit()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            for t in tables:
+                t0 = time.time()
+                cur.execute(f"ANALYZE {SCHEMA}.{t}")
+                print(f"   ANALYZE {SCHEMA}.{t:<14} {time.time()-t0:>5.1f}s")
+            for mv in MATVIEWS:
+                t0 = time.time()
+                cur.execute(f"REFRESH MATERIALIZED VIEW {SCHEMA}.{mv}")
+                print(f"   REFRESH {SCHEMA}.{mv:<14} {time.time()-t0:>5.1f}s")
+    finally:
+        conn.autocommit = prev_autocommit
+
+
 # ── EXTRACCIÓN DESDE movik.db ────────────────────────────────────────────────
 def open_db() -> sqlite3.Connection:
     if not DB_FILE.exists():
@@ -475,6 +505,9 @@ def main():
         if "maestro" in targets:
             push(pg, "maestro", MAESTRO_COLS, build_maestro(conn),
                  "dot_number", args.batch, args.dry_run)
+
+        if not args.dry_run:
+            finalize(pg, targets)
     finally:
         conn.close()
         if pg:

@@ -34,6 +34,16 @@ fi
 SIZE=$(du -h "$DB" | cut -f1)
 echo "📦 Subiendo $DB ($SIZE) al release $TAG de $REPO"
 
+# `gh auth` y el credential helper de git pueden tener cuentas distintas, y
+# sólo una de las dos suele ver los repos de la org. Si gh no llega al repo,
+# se reintenta con el token que usa git para pushear.
+if ! gh repo view "$REPO" >/dev/null 2>&1; then
+  echo "   gh no ve $REPO; usando el token del credential helper de git"
+  GH_TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null \
+             | sed -n 's/^password=//p')
+  export GH_TOKEN
+fi
+
 # El release es un contenedor fijo: se crea una vez y después solo se
 # reemplaza el asset con --clobber.
 if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

@@ -132,6 +132,40 @@ CREATE INDEX idx_maestro_units   ON movik.maestro (units);
 CREATE INDEX idx_maestro_pri     ON movik.maestro (priority);
 CREATE INDEX idx_maestro_name    ON movik.maestro (legal_name);
 
+-- Índice que sostiene el orden de la bandeja de alertas.
+--
+-- La app ordena por `days`, que es una columna calculada
+-- (expires_date_iso - CURRENT_DATE): ningún índice puede servir ese ORDER BY y
+-- Postgres termina ordenando las 114k filas con prioridad real en cada página
+-- (~2.3 s). Pero CURRENT_DATE es constante dentro de una query, así que
+-- ordenar por `days` y por `expires_date_iso` da EXACTAMENTE el mismo orden.
+--
+-- El único riesgo sería que `days` tuviera valor donde expires_date_iso es
+-- NULL, por el COALESCE con days_to_expiry. Verificado sobre los datos reales:
+-- 0 filas en ese caso — days_to_expiry nunca viene sin su fecha. Por eso el
+-- adaptador de Supabase ordena por expires_date_iso y usa este índice.
+CREATE INDEX idx_maestro_sort
+    ON movik.maestro (prio_rank, expires_date_iso NULLS LAST, legal_name);
+
+-- Búsqueda por nombre. La app usa LIKE '%term%', y un comodín inicial deja
+-- inútil a un índice B-tree: eran 3.6 s de seq scan. Trigramas lo resuelven.
+-- Sin calificar el opclass a propósito: Supabase instala pg_trgm en public en
+-- unos proyectos y en extensions en otros, y los dos están en el search_path.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX idx_maestro_search ON movik.maestro
+    USING gin (search_name gin_trgm_ops);
+
+-- El buscador de /carriers es un OR de tres columnas
+-- (search_name LIKE '%t%' OR dot_number LIKE 't%' OR phy_city ILIKE 't%').
+-- Postgres sólo puede combinarlas con un BitmapOr si las TRES tienen índice
+-- utilizable; con una sola sin cubrir cae a seq scan y la query entera muere
+-- por statement timeout. De ahí estos dos:
+--   · phy_city va con trigramas porque ILIKE no puede usar un btree normal.
+--   · dot_number necesita text_pattern_ops: con la collation por defecto, un
+--     btree corriente no sirve para LIKE 'prefijo%'.
+CREATE INDEX idx_maestro_city    ON movik.maestro USING gin (phy_city gin_trgm_ops);
+CREATE INDEX idx_maestro_dot_pat ON movik.maestro (dot_number text_pattern_ops);
+
 -- ── maestro_live ────────────────────────────────────────────────────────────
 -- `days` no puede ser una columna: envejecería un día por cada día que pasa sin
 -- recargar. Se calcula al leer, igual que hace db.ts en local con julianday().
@@ -140,30 +174,41 @@ SELECT m.*,
        COALESCE((m.expires_date_iso - CURRENT_DATE), m.days_to_expiry) AS days
   FROM movik.maestro m;
 
--- ── Vistas de agregados ─────────────────────────────────────────────────────
+-- ── Agregados ───────────────────────────────────────────────────────────────
 -- PostgREST no sabe hacer GROUP BY, así que los conteos que la app calcula con
--- SQL en local salen de estas vistas.
+-- SQL en local salen de aquí.
+--
+-- Son MATERIALIZADAS, no vistas normales: los KPIs del dashboard y del reporte
+-- se piden en cada carga de página, y recalcularlos cuesta entre 150 ms y 3 s
+-- (el peor es el COUNT DISTINCT de v_top_parties sobre 258k filings). Los datos
+-- sólo cambian cuando corre el loader, así que se refrescan ahí mismo:
+-- load_to_supabase.py hace REFRESH al terminar de cargar.
 
-CREATE OR REPLACE VIEW movik.v_priority_counts AS
+DROP MATERIALIZED VIEW IF EXISTS movik.mv_priority_counts CASCADE;
+CREATE MATERIALIZED VIEW movik.mv_priority_counts AS
 SELECT priority, COUNT(*)::bigint AS n
   FROM movik.maestro GROUP BY priority;
 
-CREATE OR REPLACE VIEW movik.v_state_counts AS
+DROP MATERIALIZED VIEW IF EXISTS movik.mv_state_counts CASCADE;
+CREATE MATERIALIZED VIEW movik.mv_state_counts AS
 SELECT phy_state AS code, COUNT(*)::bigint AS n
   FROM movik.maestro GROUP BY phy_state;
 
 -- Carriers distintos por secured party (top 6 del reporte).
-CREATE OR REPLACE VIEW movik.v_top_parties AS
+DROP MATERIALIZED VIEW IF EXISTS movik.mv_top_parties CASCADE;
+CREATE MATERIALIZED VIEW movik.mv_top_parties AS
 SELECT secured_party AS label, COUNT(DISTINCT dot_number)::bigint AS value
   FROM movik.ucc_filings
  WHERE match_found = 1 AND secured_party IS NOT NULL AND secured_party <> ''
  GROUP BY secured_party
  ORDER BY value DESC;
+CREATE INDEX idx_mv_top_parties ON movik.mv_top_parties (value DESC);
 
 -- Una fila por (secured party, tipo). La app reclasifica por nombre los que
 -- vienen con secured_party_type NULL (FL nunca lo llena), con las mismas
 -- reglas que en local.
-CREATE OR REPLACE VIEW movik.v_secured_parties AS
+DROP MATERIALIZED VIEW IF EXISTS movik.mv_secured_parties CASCADE;
+CREATE MATERIALIZED VIEW movik.mv_secured_parties AS
 SELECT secured_party, secured_party_type, COUNT(DISTINCT dot_number)::bigint AS n
   FROM movik.ucc_filings
  WHERE match_found = 1 AND secured_party IS NOT NULL AND secured_party <> ''
@@ -172,7 +217,8 @@ SELECT secured_party, secured_party_type, COUNT(DISTINCT dot_number)::bigint AS 
 -- Avance del scraper por estado. Se deriva de maestro.priority en vez de
 -- scrape_log: 'Sin datos' = nunca consultado, 'P1' = consultado sin match,
 -- 'Error' = la consulta falló, el resto = consultado con filings.
-CREATE OR REPLACE VIEW movik.v_scraper_status AS
+DROP MATERIALIZED VIEW IF EXISTS movik.mv_scraper_status CASCADE;
+CREATE MATERIALIZED VIEW movik.mv_scraper_status AS
 SELECT phy_state AS code,
        COUNT(*)::bigint                                                   AS total,
        COUNT(*) FILTER (WHERE priority <> 'Sin datos')::bigint            AS scraped,
@@ -206,8 +252,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA movik GRANT ALL    ON TABLES TO service_role;
 
 -- Las vistas heredan los permisos del creador (postgres) y no soportan RLS
 -- propia; los datos que exponen son los mismos que ya son legibles arriba.
-GRANT SELECT ON movik.maestro_live, movik.v_priority_counts, movik.v_state_counts,
-                movik.v_top_parties, movik.v_secured_parties, movik.v_scraper_status
+GRANT SELECT ON movik.maestro_live, movik.mv_priority_counts, movik.mv_state_counts,
+                movik.mv_top_parties, movik.mv_secured_parties, movik.mv_scraper_status
    TO anon, authenticated, service_role;
 
 -- ── Puente a public ─────────────────────────────────────────────────────────
@@ -237,15 +283,15 @@ CREATE VIEW public.movik_ucc_filings WITH (security_invoker = on) AS
 CREATE VIEW public.movik_carriers WITH (security_invoker = on) AS
   SELECT * FROM movik.carriers;
 CREATE VIEW public.movik_priority_counts WITH (security_invoker = on) AS
-  SELECT * FROM movik.v_priority_counts;
+  SELECT * FROM movik.mv_priority_counts;
 CREATE VIEW public.movik_state_counts WITH (security_invoker = on) AS
-  SELECT * FROM movik.v_state_counts;
+  SELECT * FROM movik.mv_state_counts;
 CREATE VIEW public.movik_top_parties WITH (security_invoker = on) AS
-  SELECT * FROM movik.v_top_parties;
+  SELECT * FROM movik.mv_top_parties;
 CREATE VIEW public.movik_secured_parties WITH (security_invoker = on) AS
-  SELECT * FROM movik.v_secured_parties;
+  SELECT * FROM movik.mv_secured_parties;
 CREATE VIEW public.movik_scraper_status WITH (security_invoker = on) AS
-  SELECT * FROM movik.v_scraper_status;
+  SELECT * FROM movik.mv_scraper_status;
 
 GRANT SELECT ON public.movik_maestro, public.movik_ucc_filings,
                 public.movik_carriers, public.movik_priority_counts,
