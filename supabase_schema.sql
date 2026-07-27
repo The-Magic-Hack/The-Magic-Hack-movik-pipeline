@@ -1,17 +1,22 @@
 -- ============================================================================
 -- movik/supabase_schema.sql
 -- ============================================================================
--- Pégalo COMPLETO en el SQL Editor de Supabase y ejecútalo UNA vez, ANTES de
--- correr load_to_supabase.py.
+-- Todas las tablas del proyecto viven en el schema "movik".
 --
--- ¿Por qué manual?  supabase-py habla con PostgREST, que es una API de DATOS:
--- sabe hacer SELECT/INSERT/UPDATE/DELETE sobre tablas que ya existen, pero no
--- ejecuta DDL (CREATE SCHEMA / CREATE TABLE). No hay forma de que el script
--- cree el schema por su cuenta con la service key.
+-- Se aplica solo:   python load_to_supabase.py --init-schema
+-- o a mano:         pégalo en el SQL Editor de Supabase y ejecútalo.
 --
--- DESPUÉS de correr esto, un paso más en la consola web:
---   Settings → API → "Exposed schemas" → agrega  movik  → Save
--- Sin eso PostgREST devuelve 404/406 aunque las tablas existan.
+-- Es idempotente (DROP ... IF EXISTS + CREATE), así que se puede volver a
+-- correr; ojo que eso VACÍA las tablas y hay que recargar.
+--
+-- SOBRE "Exposed schemas"
+-- -----------------------
+-- PostgREST — la API REST que usa supabase-js con la anon key — solo sirve los
+-- schemas que estén en Settings → API → Exposed schemas. Ese ajuste no siempre
+-- está disponible, así que NO dependemos de él: al final de este archivo se
+-- crean vistas en "public" (que PostgREST expone siempre) apuntando a las
+-- tablas de "movik". Los datos siguen viviendo en movik; public solo tiene
+-- punteros de solo lectura.
 -- ============================================================================
 
 CREATE SCHEMA IF NOT EXISTS movik;
@@ -203,6 +208,49 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA movik GRANT ALL    ON TABLES TO service_role;
 -- propia; los datos que exponen son los mismos que ya son legibles arriba.
 GRANT SELECT ON movik.maestro_live, movik.v_priority_counts, movik.v_state_counts,
                 movik.v_top_parties, movik.v_secured_parties, movik.v_scraper_status
+   TO anon, authenticated, service_role;
+
+-- ── Puente a public ─────────────────────────────────────────────────────────
+-- Movikapp lee por PostgREST con la anon key, y PostgREST solo sirve los
+-- schemas expuestos. Como "movik" no se puede exponer desde la consola, estas
+-- vistas en public son la puerta de entrada. Prefijo movik_ para que se vea de
+-- dónde salen y no choquen con nada más del proyecto.
+--
+-- security_invoker = on: la vista se ejecuta con los permisos de quien
+-- consulta, no con los de postgres. Así siguen aplicando las políticas RLS de
+-- arriba en vez de saltárselas. Requiere Postgres 15+ (Supabase lo es).
+
+DROP VIEW IF EXISTS public.movik_maestro         CASCADE;
+DROP VIEW IF EXISTS public.movik_ucc_filings     CASCADE;
+DROP VIEW IF EXISTS public.movik_carriers        CASCADE;
+DROP VIEW IF EXISTS public.movik_priority_counts CASCADE;
+DROP VIEW IF EXISTS public.movik_state_counts    CASCADE;
+DROP VIEW IF EXISTS public.movik_top_parties     CASCADE;
+DROP VIEW IF EXISTS public.movik_secured_parties CASCADE;
+DROP VIEW IF EXISTS public.movik_scraper_status  CASCADE;
+
+-- maestro_live y no maestro: la app necesita `days` calculado al día de hoy.
+CREATE VIEW public.movik_maestro WITH (security_invoker = on) AS
+  SELECT * FROM movik.maestro_live;
+CREATE VIEW public.movik_ucc_filings WITH (security_invoker = on) AS
+  SELECT * FROM movik.ucc_filings;
+CREATE VIEW public.movik_carriers WITH (security_invoker = on) AS
+  SELECT * FROM movik.carriers;
+CREATE VIEW public.movik_priority_counts WITH (security_invoker = on) AS
+  SELECT * FROM movik.v_priority_counts;
+CREATE VIEW public.movik_state_counts WITH (security_invoker = on) AS
+  SELECT * FROM movik.v_state_counts;
+CREATE VIEW public.movik_top_parties WITH (security_invoker = on) AS
+  SELECT * FROM movik.v_top_parties;
+CREATE VIEW public.movik_secured_parties WITH (security_invoker = on) AS
+  SELECT * FROM movik.v_secured_parties;
+CREATE VIEW public.movik_scraper_status WITH (security_invoker = on) AS
+  SELECT * FROM movik.v_scraper_status;
+
+GRANT SELECT ON public.movik_maestro, public.movik_ucc_filings,
+                public.movik_carriers, public.movik_priority_counts,
+                public.movik_state_counts, public.movik_top_parties,
+                public.movik_secured_parties, public.movik_scraper_status
    TO anon, authenticated, service_role;
 
 NOTIFY pgrst, 'reload schema';

@@ -47,21 +47,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install supabase
 
-      - name: Recuperar movik.db del run anterior
+      # Igual que en scraper_fl.yml: artifact del run anterior, y si no hay,
+      # el release "db-seed". Refrescar la semilla con:  bash seed_db.sh
+      - name: Recuperar movik.db
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PREV=$(gh run list --workflow=scraper_ca.yml --status=success \
                    --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-          if [ -z "$PREV" ]; then
-            echo "::warning::Sin run previo exitoso; no hay movik.db que restaurar."
-            exit 0
+          if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-ca --dir .; then
+            echo "Estado restaurado del run $PREV"
+          else
+            echo "Sin artifact previo; bajando el release db-seed"
+            gh release download db-seed --pattern 'movik.db' --clobber \
+              || echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
           fi
-          echo "Restaurando estado del run $PREV"
-          gh run download "$PREV" --name movik-state-ca --dir . || \
-            echo "::warning::El run $PREV no dejó artifact movik-state-ca."
           ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
 
       # ca_ucc_scraper.py NO acepta --state: es CA-only por diseño (pega contra
@@ -90,6 +91,5 @@ jobs:
       - name: Cargar a Supabase (schema movik)
         if: success()
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python -u load_to_supabase.py --only ${{ inputs.tables }}

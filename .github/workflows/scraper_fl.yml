@@ -46,24 +46,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install supabase
 
       # movik.db no vive en el repo (168 MB): viaja como artifact de un run al
-      # siguiente. El primer run no encuentra nada y arranca de cero — para ese
-      # caso hay que subir un movik.db semilla con el censo ya cargado.
-      - name: Recuperar movik.db del run anterior
+      # siguiente. Si no hay run previo (el primero, o los artifacts vencieron)
+      # cae al release "db-seed", que es la copia semilla con el censo cargado.
+      # Para refrescar esa semilla:  bash seed_db.sh
+      - name: Recuperar movik.db
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PREV=$(gh run list --workflow=scraper_fl.yml --status=success \
                    --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-          if [ -z "$PREV" ]; then
-            echo "::warning::Sin run previo exitoso; no hay movik.db que restaurar."
-            exit 0
+          if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-fl --dir .; then
+            echo "Estado restaurado del run $PREV"
+          else
+            echo "Sin artifact previo; bajando el release db-seed"
+            gh release download db-seed --pattern 'movik.db' --clobber \
+              || echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
           fi
-          echo "Restaurando estado del run $PREV"
-          gh run download "$PREV" --name movik-state-fl --dir . || \
-            echo "::warning::El run $PREV no dejó artifact movik-state-fl."
           ls -lh movik.db scraper_checkpoint.json 2>/dev/null || true
 
       - name: Correr scraper FL
@@ -90,6 +90,5 @@ jobs:
       - name: Cargar a Supabase (schema movik)
         if: success()
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python -u load_to_supabase.py --only ${{ inputs.tables }}

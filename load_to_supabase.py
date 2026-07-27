@@ -1,42 +1,53 @@
 """
 movik/load_to_supabase.py
 =========================
-Carga movik.db → Supabase, schema "movik".
+Carga movik.db → Supabase (Postgres), schema "movik".
 
 Tablas que escribe:
   movik.carriers     espejo 1:1 de la tabla carriers de movik.db
   movik.ucc_filings  espejo 1:1 de la tabla ucc_filings de movik.db
   movik.maestro      el join final carriers × scrape_log × filing representativo
 
-Requisitos previos (una sola vez):
-  1. pip install supabase
-  2. Correr supabase_schema.sql en el SQL Editor de Supabase.
-     El schema y las tablas NO los crea este script: supabase-py habla con
-     PostgREST, que es una API de datos y no ejecuta DDL.
-  3. Supabase → Settings → API → "Exposed schemas" → agregar  movik.
-     Sin eso PostgREST responde 404 aunque las tablas existan.
+¿Por qué psycopg2 y no supabase-py?
+-----------------------------------
+supabase-py habla con PostgREST, que solo sirve los schemas marcados en
+Settings → API → Exposed schemas. Ese ajuste no está disponible en este
+proyecto, así que "movik" sería invisible para la API REST. La conexión
+directa a Postgres no tiene esa restricción, además de ser bastante más
+rápida para cargas de medio millón de filas y de poder crear el schema sola
+(PostgREST no ejecuta DDL).
 
-Credenciales (variables de entorno o archivo .env junto a este script):
-  SUPABASE_URL          https://xxxx.supabase.co
-  SUPABASE_SERVICE_KEY  la service_role key (NO la anon)
+Movikapp sí sigue leyendo por PostgREST con la anon key: para eso
+supabase_schema.sql crea vistas public.movik_* que apuntan a movik.*.
+
+Requisitos:
+  pip install psycopg2-binary
+
+Credenciales (variable de entorno o archivo .env junto a este script):
+  SUPABASE_DB_URL   postgresql://postgres.<ref>:<password>@<host>:5432/postgres
+
+  Se saca de Supabase → Settings → Database → Connection string → URI.
+  Usa la de "Session pooler" (puerto 5432): la conexión directa a
+  db.<ref>.supabase.co es solo IPv6 y no resuelve desde Windows ni desde los
+  runners de GitHub Actions.
 
 Uso:
-  python load_to_supabase.py                      # las 3 tablas
-  python load_to_supabase.py --only maestro       # solo una
-  python load_to_supabase.py --batch 500          # batches más chicos
-  python load_to_supabase.py --dry-run            # arma todo, no sube nada
+  python load_to_supabase.py --init-schema      # aplica supabase_schema.sql
+  python load_to_supabase.py                    # carga las 3 tablas
+  python load_to_supabase.py --only maestro     # solo una
+  python load_to_supabase.py --batch 500
+  python load_to_supabase.py --dry-run          # arma todo, no escribe
 
-Idempotente: todo se sube con upsert sobre la PK, así que repetir la carga
-actualiza en vez de duplicar. Para partir de cero, vuelve a correr
-supabase_schema.sql (hace DROP TABLE).
+Idempotente: todo va con INSERT ... ON CONFLICT DO UPDATE sobre la PK, así que
+repetir la carga actualiza en vez de duplicar.
 
 NOTA sobre el filing representativo
 -----------------------------------
 Un carrier puede tener varios filings. El representativo aquí es el MISMO que
-elige Movikapp/src/lib/db.ts: el gravamen activo que vence antes. 03_build_master.py
-toma en cambio el primero por id, lo que produce filas donde la prioridad y los
-días mostrados vienen de filings distintos. Como esta tabla es la que alimenta
-la app, manda el criterio de la app.
+elige Movikapp/src/lib/db.ts: el gravamen activo que vence antes.
+03_build_master.py toma en cambio el primero por id, lo que produce filas donde
+la prioridad y los días mostrados vienen de filings distintos. Como esta tabla
+alimenta la app, manda el criterio de la app.
 """
 
 import argparse
@@ -44,6 +55,7 @@ import os
 import sqlite3
 import sys
 import time
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -52,6 +64,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE = BASE_DIR / "movik.db"
+SCHEMA_SQL = BASE_DIR / "supabase_schema.sql"
 SCHEMA = "movik"
 BATCH_SIZE = 1_000
 
@@ -63,15 +76,11 @@ SCRAPED_STATES = {"FL", "CA"}
 PRIORITY_RANK = {"P1": 0, "P2b": 1, "P2c": 2, "P2a": 3, "P3": 4, "P4": 5}
 
 try:
-    from supabase import create_client
+    import psycopg2
+    from psycopg2.extras import execute_values
 except ImportError:
-    print("Falta supabase-py  →  pip install supabase")
+    print("Falta psycopg2  →  pip install psycopg2-binary")
     sys.exit(1)
-
-try:  # la ruta del import cambió entre versiones de supabase-py
-    from supabase import ClientOptions  # type: ignore
-except ImportError:  # pragma: no cover
-    from supabase.lib.client_options import ClientOptions  # type: ignore
 
 
 # ── CREDENCIALES ─────────────────────────────────────────────────────────────
@@ -88,32 +97,36 @@ def load_dotenv_if_present():
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def get_client():
+def connect_pg():
     load_dotenv_if_present()
-    url = (os.environ.get("SUPABASE_URL") or "").strip()
-    key = (os.environ.get("SUPABASE_SERVICE_KEY") or "").strip()
-
-    if not url or not key:
-        print("❌ Faltan credenciales.")
-        print("   Define SUPABASE_URL y SUPABASE_SERVICE_KEY (env o movik/.env).")
+    dsn = (os.environ.get("SUPABASE_DB_URL") or "").strip()
+    if not dsn:
+        print("❌ Falta SUPABASE_DB_URL (variable de entorno o movik/.env).")
+        print("   Supabase → Settings → Database → Connection string → URI")
+        print("   Usa la de 'Session pooler', puerto 5432.")
         sys.exit(1)
 
-    # create_client espera la URL base del proyecto, no el endpoint /rest/v1/.
-    for suffix in ("/rest/v1/", "/rest/v1", "/"):
-        if url.endswith(suffix):
-            url = url[: -len(suffix)]
-            break
+    # sslmode=require: Supabase rechaza conexiones en claro, y si la URI viene
+    # sin el parámetro psycopg2 no lo asume.
+    if "sslmode=" not in dsn:
+        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
 
-    return create_client(url, key, options=ClientOptions(schema=SCHEMA))
+    conn = psycopg2.connect(dsn, connect_timeout=30)
+    conn.autocommit = False
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database(), current_user, version()")
+        db, user, ver = cur.fetchone()
+    print(f"   Conectado: {db} como {user}")
+    print(f"   {ver.split(',')[0]}")
+    return conn
 
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
-def to_iso(mmddyyyy: str | None) -> str | None:
+def to_iso(mmddyyyy):
     """MM/DD/YYYY → YYYY-MM-DD. Cualquier cosa rara → None."""
     if not mmddyyyy:
         return None
-    s = str(mmddyyyy).strip()
-    parts = s.split("/")
+    parts = str(mmddyyyy).strip().split("/")
     if len(parts) != 3:
         return None
     mm, dd, yyyy = parts
@@ -134,7 +147,7 @@ def to_int(v):
         return None
 
 
-def push(client, table: str, rows: list[dict], on_conflict: str,
+def push(conn, table: str, cols: list[str], rows: list[dict], pk: str,
          batch: int, dry_run: bool):
     """Sube `rows` en batches, con progreso por batch."""
     total = len(rows)
@@ -143,6 +156,13 @@ def push(client, table: str, rows: list[dict], on_conflict: str,
         return
 
     n_batches = (total + batch - 1) // batch
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    updates = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in cols if c != pk)
+    sql = (
+        f'INSERT INTO {SCHEMA}.{table} ({col_list}) VALUES %s '
+        f'ON CONFLICT ("{pk}") DO UPDATE SET {updates}'
+    )
+
     t0 = time.time()
     done = 0
 
@@ -151,11 +171,15 @@ def push(client, table: str, rows: list[dict], on_conflict: str,
         idx = i // batch + 1
 
         if not dry_run:
+            values = [tuple(r[c] for c in cols) for r in chunk]
             for attempt in range(1, 4):
                 try:
-                    client.table(table).upsert(chunk, on_conflict=on_conflict).execute()
+                    with conn.cursor() as cur:
+                        execute_values(cur, sql, values, page_size=batch)
+                    conn.commit()
                     break
-                except Exception as e:  # noqa: BLE001 — la API puede fallar por red o 429
+                except psycopg2.Error as e:
+                    conn.rollback()
                     if attempt == 3:
                         print(f"\n❌ Batch {idx}/{n_batches} de {table} falló: {e}")
                         raise
@@ -175,6 +199,24 @@ def push(client, table: str, rows: list[dict], on_conflict: str,
         )
 
     print(f"   ✅ {SCHEMA}.{table}: {done:,} filas en {(time.time()-t0)/60:.1f} min")
+
+
+# ── SCHEMA ───────────────────────────────────────────────────────────────────
+def init_schema(conn):
+    """Aplica supabase_schema.sql. Esto VACÍA las tablas (hace DROP)."""
+    if not SCHEMA_SQL.exists():
+        print(f"❌ {SCHEMA_SQL} no existe.")
+        sys.exit(1)
+    print(f"\n🏗️  Aplicando {SCHEMA_SQL.name}...")
+    with conn.cursor() as cur:
+        cur.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_name, table_type FROM information_schema.tables "
+            "WHERE table_schema = %s ORDER BY table_name", (SCHEMA,))
+        objs = cur.fetchall()
+    print(f"   ✅ schema {SCHEMA}: " + ", ".join(f"{n}" for n, _ in objs))
 
 
 # ── EXTRACCIÓN DESDE movik.db ────────────────────────────────────────────────
@@ -265,17 +307,28 @@ SELECT
   c.phy_zip, c.phone, c.cell_phone, c.email_address, c.company_officer_1,
   c.power_units, c.truck_units, c.fleetsize, c.total_drivers,
   c.classdef, c.carrier_operation, c.safety_rating, c.mcs150_date,
-  s.status  AS log_status,
-  s.error_msg AS log_error,
+  s.status     AS log_status,
+  s.error_msg  AS log_error,
   s.scraped_at AS log_scraped_at,
   r.rep_id, r.n_filings, r.n_filed, r.n_lapsed,
   f.alert_priority, f.ucc_number, f.date_filed, f.expires_date, f.days_to_expiry,
   f.secured_party, f.secured_party_type, f.filing_status, f.state_registry
 FROM carriers c
-LEFT JOIN scrape_log s ON s.dot_number = c.dot_number
-LEFT JOIN mv_rep     r ON r.dot_number = c.dot_number
+LEFT JOIN scrape_log s  ON s.dot_number = c.dot_number
+LEFT JOIN mv_rep     r  ON r.dot_number = c.dot_number
 LEFT JOIN ucc_filings f ON f.id = r.rep_id
 """
+
+MAESTRO_COLS = [
+    "dot_number", "legal_name", "dba_name", "phy_state", "phy_city", "phy_street",
+    "phy_zip", "phone", "cell_phone", "email_address", "company_officer_1",
+    "power_units", "truck_units", "fleetsize", "total_drivers", "units",
+    "classdef", "carrier_operation", "safety_rating", "mcs150_date",
+    "priority", "prio_rank", "ucc_found", "ucc_number", "date_filed",
+    "expires_date", "expires_date_iso", "days_to_expiry", "secured_party",
+    "secured_party_type", "filing_status", "state_registry", "n_filings",
+    "scraped_at", "notes", "search_name",
+]
 
 
 def build_maestro(conn) -> list[dict]:
@@ -287,15 +340,15 @@ def build_maestro(conn) -> list[dict]:
         state = (r["phy_state"] or "").strip()
         status = r["log_status"]
 
-        # Misma regla que db.ts y 03_build_master.py:
-        # sin fila en scrape_log el carrier NUNCA se consultó → "Sin datos", no P1.
+        # Misma regla que db.ts y 03_build_master.py: sin fila en scrape_log el
+        # carrier NUNCA se consultó → "Sin datos", no P1. Marcarlo P1 lo
+        # volvería un lead falso indistinguible de uno real.
         if status == "error":
             priority = "Error"
         elif status == "not_found":
             priority = "P1"
         elif status == "found":
-            # 'found' sin filing representativo no debería pasar; si pasa, es un
-            # dato roto, no un P1 (inventarlo crearía un lead falso).
+            # 'found' sin filing representativo es un dato roto, no un P1.
             priority = "Error" if r["rep_id"] is None else (r["alert_priority"] or "P4")
         else:
             priority = "Sin datos"
@@ -363,7 +416,6 @@ def build_maestro(conn) -> list[dict]:
         })
 
     # Resumen igual al que imprime 03_build_master.py, para poder compararlos.
-    from collections import Counter
     by_state = Counter(x["phy_state"] for x in rows)
     by_prio = Counter(x["priority"] for x in rows)
     print(f"   {len(rows):,} filas de maestro")
@@ -381,6 +433,10 @@ def main():
                     choices=["carriers", "ucc_filings", "maestro"],
                     help="Cargar solo estas tablas")
     ap.add_argument("--batch", type=int, default=BATCH_SIZE, metavar="N")
+    ap.add_argument("--init-schema", action="store_true",
+                    help="Aplicar supabase_schema.sql antes de cargar (VACÍA las tablas)")
+    ap.add_argument("--schema-only", action="store_true",
+                    help="Aplicar supabase_schema.sql y salir")
     ap.add_argument("--dry-run", action="store_true",
                     help="Extrae y arma todo pero no escribe en Supabase")
     args = ap.parse_args()
@@ -389,29 +445,40 @@ def main():
 
     print(f"\n🚀 Movik → Supabase  ·  schema \"{SCHEMA}\"")
     print(f"   Origen:  {DB_FILE}")
-    print(f"   Tablas:  {', '.join(targets)}")
-    print(f"   Batch:   {args.batch:,} filas")
     if args.dry_run:
         print("   ⚠️  DRY RUN: no se escribe nada")
 
-    client = None if args.dry_run else get_client()
+    pg = None if args.dry_run else connect_pg()
+
+    if (args.init_schema or args.schema_only) and not args.dry_run:
+        init_schema(pg)
+        if args.schema_only:
+            pg.close()
+            print("\n✅ Schema aplicado.")
+            return
+
+    print(f"   Tablas:  {', '.join(targets)}")
+    print(f"   Batch:   {args.batch:,} filas")
+
     conn = open_db()
     t0 = time.time()
 
     try:
         if "carriers" in targets:
-            push(client, "carriers", extract_carriers(conn), "dot_number",
-                 args.batch, args.dry_run)
+            push(pg, "carriers", CARRIER_COLS, extract_carriers(conn),
+                 "dot_number", args.batch, args.dry_run)
 
         if "ucc_filings" in targets:
-            push(client, "ucc_filings", extract_ucc(conn), "id",
-                 args.batch, args.dry_run)
+            push(pg, "ucc_filings", UCC_COLS, extract_ucc(conn),
+                 "id", args.batch, args.dry_run)
 
         if "maestro" in targets:
-            push(client, "maestro", build_maestro(conn), "dot_number",
-                 args.batch, args.dry_run)
+            push(pg, "maestro", MAESTRO_COLS, build_maestro(conn),
+                 "dot_number", args.batch, args.dry_run)
     finally:
         conn.close()
+        if pg:
+            pg.close()
 
     print(f"\n✅ Listo en {(time.time()-t0)/60:.1f} min")
 

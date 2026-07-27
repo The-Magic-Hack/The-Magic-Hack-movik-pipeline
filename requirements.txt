@@ -11,6 +11,9 @@ openpyxl>=3.1               # export Excel
 # Scraper
 asyncio-throttle>=1.0       # rate limiting elegante
 
+# Supabase
+psycopg2-binary>=2.9        # conexión directa a Postgres (load_to_supabase.py)
+
 # Utils
 python-dotenv>=1.0          # variables de entorno (.env)
 rich>=13.0                  # output bonito en consola (progress, logs)
