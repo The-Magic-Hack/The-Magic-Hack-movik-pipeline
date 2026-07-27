@@ -244,6 +244,14 @@ CREATE POLICY anon_read ON movik.carriers    FOR SELECT TO anon, authenticated U
 CREATE POLICY anon_read ON movik.ucc_filings FOR SELECT TO anon, authenticated USING (true);
 CREATE POLICY anon_read ON movik.maestro     FOR SELECT TO anon, authenticated USING (true);
 
+-- Supabase le pone 3 s de statement_timeout al rol anon. Alcanza para todo
+-- salvo un caso: el COUNT exacto de una búsqueda amplia ("TRUCK" matchea 50k
+-- carriers) la primera vez que se pide, cuando los ~15k bloques que tiene que
+-- leer todavía no están en shared_buffers. En caliente ese mismo count tarda
+-- 216 ms; en frío se pasa de 3 s y PostgREST devuelve 500.
+-- 15 s deja margen para el primer golpe sin volver aceptable una query lenta.
+ALTER ROLE anon SET statement_timeout = '15s';
+
 GRANT USAGE ON SCHEMA movik TO anon, authenticated, service_role;
 GRANT SELECT ON ALL TABLES IN SCHEMA movik TO anon, authenticated;
 GRANT ALL    ON ALL TABLES IN SCHEMA movik TO service_role;
