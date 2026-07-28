@@ -639,6 +639,39 @@ def load_ck(path: str) -> set:
     return set(json.loads(p.read_text())) if p.exists() else set()
 
 
+def load_done(ck_path: str, db_path: str, retry_errors: bool = False) -> set:
+    """
+    DOTs que no hay que volver a consultar: el checkpoint JSON UNIDO a lo que
+    ya registró scrape_log.
+
+    El JSON solo no alcanza. En GitHub Actions el primer run baja el release
+    db-seed, que lleva movik.db pero no el checkpoint, así que `done` salía
+    vacío: el scraper tomaba los primeros N carriers por mcs150_date —todos ya
+    scrapeados— y los repetía, sin avanzar el backfill y duplicando filas en
+    ucc_filings. scrape_log viaja dentro de movik.db, así que sobrevive.
+
+    Además el JSON se queda corto incluso en local: lo escribe solo este
+    scraper, mientras que scrape_log recoge también lo que hizo el de CA.
+
+    Con --retry-errors los fallidos quedan fuera del conjunto para reintentarlos.
+    """
+    done = load_ck(ck_path)
+    if not Path(db_path).exists():
+        return done
+
+    conn = sqlite3.connect(db_path)
+    try:
+        done |= {str(r[0]) for r in conn.execute("SELECT dot_number FROM scrape_log")}
+        if retry_errors:
+            done -= {str(r[0]) for r in conn.execute(
+                "SELECT dot_number FROM scrape_log WHERE status = 'error'")}
+    except sqlite3.OperationalError as e:
+        print(f"⚠️  No se pudo leer scrape_log de {db_path}: {e}")
+    finally:
+        conn.close()
+    return done
+
+
 def save_ck(path: str, done: set):
     Path(path).write_text(json.dumps(list(done)))
 
@@ -670,8 +703,9 @@ def purge_errors_from_checkpoint():
 # ORQUESTADOR PRINCIPAL
 # ────────────────────────────────────────────────────────────────────────────
 async def run(carriers: list, conn: sqlite3.Connection, ck_path: str,
-              limit: Optional[int] = None):
-    done = load_ck(ck_path)
+              limit: Optional[int] = None, done: Optional[set] = None):
+    if done is None:
+        done = load_ck(ck_path)
     todo = [c for c in carriers if c["dot_number"] not in done]
     pendientes = len(todo)
 
@@ -859,7 +893,8 @@ def main():
     conn.commit()
     print(f"💾 {DB_FILE} inicializado con {len(carriers):,} carriers")
 
-    asyncio.run(run(carriers, conn, CHECKPOINT, limit=args.test))
+    done = load_done(CHECKPOINT, DB_FILE, retry_errors=args.retry_errors)
+    asyncio.run(run(carriers, conn, CHECKPOINT, limit=args.test, done=done))
 
 
 if __name__ == "__main__":
