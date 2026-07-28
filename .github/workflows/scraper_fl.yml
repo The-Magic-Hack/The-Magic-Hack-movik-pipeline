@@ -27,6 +27,13 @@ concurrency:
   group: scraper-fl
   cancel-in-progress: false
 
+# El GITHUB_TOKEN por defecto no llega a la API de Actions, así que
+# `gh run list` / `gh run download` responden 403 y el run no encuentra el
+# movik.db del run anterior. contents:read es para el release db-seed.
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -55,14 +62,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # || true porque el step corre con `bash -e`: si gh falla, la
+          # asignación falla y el step muere antes de intentar el release.
           PREV=$(gh run list --workflow=scraper_fl.yml --status=success \
-                   --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                   --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
           if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-fl --dir .; then
             echo "Estado restaurado del run $PREV"
           else
             echo "Sin artifact previo; bajando el release db-seed"
-            gh release download db-seed --pattern 'movik.db' --clobber \
-              || echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
+            gh release download db-seed --pattern 'movik.db' --clobber
+          fi
+          # Sin movik.db el scraper no tiene carriers que consultar y el run
+          # sería un no-op silencioso: mejor fallar aquí y decir por qué.
+          if [ ! -f movik.db ]; then
+            echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
+            exit 1
           fi
           ls -lh movik.db scraper_checkpoint.json 2>/dev/null || true
 
