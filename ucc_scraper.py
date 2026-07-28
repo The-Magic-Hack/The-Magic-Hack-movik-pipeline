@@ -566,34 +566,69 @@ async def scrape_fl(
 # ────────────────────────────────────────────────────────────────────────────
 # CARGA DE CARRIERS DESDE CSV
 # ────────────────────────────────────────────────────────────────────────────
-def load_carriers(csv_path: str, states: list, limit: Optional[int] = None) -> list[dict]:
-    if not Path(csv_path).exists():
-        print(f"❌ No se encuentra {csv_path}. Corre 01_census_incremental.py primero.")
-        sys.exit(1)
+SELECT_COLS = """
+    dot_number, legal_name, dba_name, phy_state, phy_city,
+    phy_street, phy_zip, phone, cell_phone, email_address,
+    company_officer_1, power_units, truck_units, fleetsize,
+    total_drivers, classdef, carrier_operation, safety_rating,
+    mcs150_date, status_code
+"""
 
-    st_list = ", ".join(f"'{s}'" for s in states)
-    lim = f"LIMIT {limit}" if limit else ""
-    q = f"""
-        SELECT
-            dot_number, legal_name, dba_name, phy_state, phy_city,
-            phy_street, phy_zip, phone, cell_phone, email_address,
-            company_officer_1, power_units, truck_units, fleetsize,
-            total_drivers, classdef, carrier_operation, safety_rating,
-            mcs150_date, status_code
-        FROM read_csv_auto('{csv_path}', all_varchar=true,
-                           header=true, ignore_errors=true)
-        WHERE phy_state IN ({st_list})
-          AND status_code = 'A'
-          AND legal_name IS NOT NULL
-          AND trim(legal_name) <> ''
-        ORDER BY mcs150_date DESC NULLS LAST
-        {lim}
+WHERE_ACTIVOS = """
+    WHERE phy_state IN ({states})
+      AND status_code = 'A'
+      AND legal_name IS NOT NULL
+      AND trim(legal_name) <> ''
+    ORDER BY mcs150_date DESC NULLS LAST
+"""
+
+
+def load_carriers(csv_path: str, db_path: str, states: list) -> list[dict]:
     """
-    con = duckdb.connect()
-    rows = con.execute(q).fetchall()
-    cols = [d[0] for d in con.description]
-    print(f"✅ {len(rows):,} carriers activos en {states}")
-    return [dict(zip(cols, r)) for r in rows]
+    Carriers activos de los estados pedidos.
+
+    Fuente preferida: census_file_full.csv, que es el censo completo de FMCSA.
+    Si no está, cae a la tabla `carriers` de movik.db — mismas columnas, ya
+    filtradas, puestas ahí por 05_load_carriers_db.py.
+
+    El fallback existe por GitHub Actions: el CSV pesa 1.7 GB, no cabe en el
+    repo ni tiene sentido bajarlo en cada run, pero movik.db sí viaja como
+    artifact entre runs y trae los mismos carriers.
+
+    Sin límite a propósito: `--test N` se aplica DESPUÉS de descontar lo ya
+    scrapeado (ver run()). Recortar aquí daría los N primeros por mcs150_date,
+    que a mitad de un backfill están todos hechos y el run no haría nada.
+    """
+    st_list = ", ".join(f"'{s}'" for s in states)
+    where = WHERE_ACTIVOS.format(states=st_list)
+
+    if Path(csv_path).exists():
+        q = f"""SELECT {SELECT_COLS}
+                FROM read_csv_auto('{csv_path}', all_varchar=true,
+                                   header=true, ignore_errors=true)
+                {where}"""
+        con = duckdb.connect()
+        rows = con.execute(q).fetchall()
+        cols = [d[0] for d in con.description]
+        print(f"✅ {len(rows):,} carriers activos en {states}  (fuente: {csv_path})")
+        return [dict(zip(cols, r)) for r in rows]
+
+    if Path(db_path).exists():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(f"SELECT {SELECT_COLS} FROM carriers {where}").fetchall()
+        except sqlite3.OperationalError as e:
+            print(f"❌ {db_path} no tiene una tabla `carriers` usable: {e}")
+            sys.exit(1)
+        finally:
+            con.close()
+        print(f"✅ {len(rows):,} carriers activos en {states}  (fuente: {db_path})")
+        return [dict(r) for r in rows]
+
+    print(f"❌ No se encuentra ni {csv_path} ni {db_path}.")
+    print("   Corre 01_census_incremental.py, o deja un movik.db con la tabla carriers.")
+    sys.exit(1)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -634,11 +669,20 @@ def purge_errors_from_checkpoint():
 # ────────────────────────────────────────────────────────────────────────────
 # ORQUESTADOR PRINCIPAL
 # ────────────────────────────────────────────────────────────────────────────
-async def run(carriers: list, conn: sqlite3.Connection, ck_path: str):
+async def run(carriers: list, conn: sqlite3.Connection, ck_path: str,
+              limit: Optional[int] = None):
     done = load_ck(ck_path)
     todo = [c for c in carriers if c["dot_number"] not in done]
+    pendientes = len(todo)
 
-    print(f"\n📋 Total: {len(carriers):,} | Procesados: {len(done):,} | Pendientes: {len(todo):,}")
+    # `--test N` recorta aquí, sobre lo que falta, no sobre el censo entero.
+    if limit:
+        todo = todo[:limit]
+
+    print(f"\n📋 Total: {len(carriers):,} | Procesados: {len(done):,} | "
+          f"Pendientes: {pendientes:,}")
+    if limit:
+        print(f"🔬 --test {limit}: se corren {len(todo):,} de esos {pendientes:,}")
     print(f"⚙️  {CONCURRENT} workers | techo {RATE_PER_SEC} req/s | "
           f"ETA ~{len(todo)/RATE_PER_SEC/3600:.1f}h\n")
     if not todo:
@@ -801,7 +845,7 @@ def main():
         print("   Correrlos contra el registro de Florida daría datos sin sentido.")
         sys.exit(1)
 
-    carriers = load_carriers(CSV_FILE, states, limit=args.test)
+    carriers = load_carriers(CSV_FILE, DB_FILE, states)
     if not carriers:
         print("No hay carriers. Verifica el CSV y los estados.")
         sys.exit(1)
@@ -815,7 +859,7 @@ def main():
     conn.commit()
     print(f"💾 {DB_FILE} inicializado con {len(carriers):,} carriers")
 
-    asyncio.run(run(carriers, conn, CHECKPOINT))
+    asyncio.run(run(carriers, conn, CHECKPOINT, limit=args.test))
 
 
 if __name__ == "__main__":
