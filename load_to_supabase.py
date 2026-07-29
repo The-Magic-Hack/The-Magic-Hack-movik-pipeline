@@ -35,11 +35,28 @@ Uso:
   python load_to_supabase.py --init-schema      # aplica supabase_schema.sql
   python load_to_supabase.py                    # carga las 3 tablas
   python load_to_supabase.py --only maestro     # solo una
-  python load_to_supabase.py --batch 500
   python load_to_supabase.py --dry-run          # arma todo, no escribe
+  python load_to_supabase.py --upsert           # método viejo, ver abajo
 
-Idempotente: todo va con INSERT ... ON CONFLICT DO UPDATE sobre la PK, así que
-repetir la carga actualiza en vez de duplicar.
+CÓMO CARGA
+----------
+Por defecto: COPY a una tabla de staging, y al final un traslado atómico a la
+definitiva. Dos razones.
+
+La primera es que aguanta. Antes se cargaba con 533 INSERT ... ON CONFLICT de
+1.000 filas. Con la tabla en 20 columnas funcionaba; al pasarla a 145 saturó la
+instancia de Supabase — iba a 1.500 filas/s, se derrumbó a 26 y terminó
+rechazando conexiones. COPY es el camino que usa Postgres para carga masiva: una
+sentencia, sin evaluar conflictos, sin 533 idas y vueltas por la red, y con
+mucho menos WAL.
+
+La segunda es que no deja a la webapp sin datos. Recrear la tabla y cargarla
+directo la dejaba en cero filas durante toda la carga. Ahora la parte lenta va a
+staging, fuera del camino, y la definitiva se reemplaza en una transacción
+corta. Ver load_swap() para por qué no se hace con RENAME.
+
+`--upsert` vuelve al método viejo. Sirve para cargas parciales donde haya que
+preservar lo que ya está en la tabla, porque el método nuevo la vacía.
 
 NOTA sobre el filing representativo
 -----------------------------------
@@ -51,6 +68,7 @@ alimenta la app, manda el criterio de la app.
 """
 
 import argparse
+import io
 import os
 import sqlite3
 import sys
@@ -147,9 +165,100 @@ def to_int(v):
         return None
 
 
+#: Escapes del formato TEXT de COPY. El orden importa: la barra invertida va
+#: primero, si no se re-escaparían las que introducen los demás.
+_COPY_ESCAPES = (("\\", "\\\\"), ("\t", "\\t"), ("\n", "\\n"), ("\r", "\\r"))
+
+
+def _copy_field(v) -> str:
+    r"""
+    Serializa un valor al formato TEXT de COPY.
+
+    Se usa TEXT y no CSV a propósito. En `FORMAT csv` el NULL se representa con
+    un campo vacío sin comillas, y `\N` sería la cadena literal de dos
+    caracteres: escribir `\N` para los nulos habría metido el texto "\N" en
+    cada celda vacía de las 162 columnas, y habría convertido en NULL cada
+    cadena vacía legítima. En TEXT, `\N` ES el nulo y la cadena vacía se
+    distingue de él, que es justo lo que hace falta.
+    """
+    if v is None:
+        return "\\N"
+    s = str(v)
+    for viejo, nuevo in _COPY_ESCAPES:
+        s = s.replace(viejo, nuevo)
+    return s
+
+
+class _RowsAsCopyText(io.RawIOBase):
+    """
+    Convierte las filas al formato TEXT de COPY sobre la marcha.
+
+    No se arma el volcado completo en memoria ni en disco: COPY lee de aquí y
+    esta clase serializa de a mil filas. Con 532.167 × 162 columnas, el texto
+    entero son varios cientos de MB.
+    """
+
+    def __init__(self, rows, cols, on_progress=None, every=20_000):
+        self.rows, self.cols = rows, cols
+        self.on_progress, self.every = on_progress, every
+        self.i, self.buf = 0, b""
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        # Se rellena el buffer hasta cubrir lo que pide el lector.
+        while len(self.buf) < len(b) and self.i < len(self.rows):
+            hasta = min(self.i + 1000, len(self.rows))
+            trozo = "".join(
+                "\t".join(_copy_field(r.get(c)) for c in self.cols) + "\n"
+                for r in self.rows[self.i : hasta]
+            )
+            self.buf += trozo.encode("utf-8")
+            prev, self.i = self.i, hasta
+            if self.on_progress and (hasta // self.every) > (prev // self.every):
+                self.on_progress(hasta)
+
+        n = min(len(b), len(self.buf))
+        b[:n], self.buf = self.buf[:n], self.buf[n:]
+        return n
+
+
+def copy_into(conn, table: str, cols: list[str], rows: list[dict]) -> None:
+    """
+    Carga con COPY FROM STDIN. Una sola sentencia en vez de 533 INSERT.
+
+    Por qué: con la tabla en 145 columnas, 533 INSERT ... ON CONFLICT de 1.000
+    filas saturaron la instancia — iba a 1.500 filas/s, cayó a 26 y terminó
+    dejando de aceptar conexiones. COPY es el camino que usa Postgres para carga
+    masiva: no evalúa conflictos, no hace 533 round-trips y escribe con mucho
+    menos WAL. Sirve porque la tabla destino está recién creada y vacía.
+    """
+    total = len(rows)
+    t0 = time.time()
+
+    def progreso(n):
+        elapsed = time.time() - t0
+        rate = n / elapsed if elapsed else 0
+        eta = (total - n) / rate if rate else 0
+        print(f"   [{SCHEMA}.{table}] {n:>7,}/{total:,} filas  "
+              f"{rate:>6.0f} filas/s  ETA {eta/60:>4.1f} min", flush=True)
+
+    src = _RowsAsCopyText(rows, cols, on_progress=progreso)
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    with conn.cursor() as cur:
+        cur.copy_expert(
+            f"COPY {SCHEMA}.{table} ({col_list}) FROM STDIN",
+            src, size=1 << 20,
+        )
+    conn.commit()
+    print(f"   ✅ {SCHEMA}.{table}: {total:,} filas en {(time.time()-t0)/60:.1f} min "
+          f"({total/max(time.time()-t0, 1):.0f} filas/s)")
+
+
 def push(conn, table: str, cols: list[str], rows: list[dict], pk: str,
          batch: int, dry_run: bool):
-    """Sube `rows` en batches, con progreso por batch."""
+    """Sube `rows` en batches con upsert, para cuando la tabla ya tiene datos."""
     total = len(rows)
     if total == 0:
         print(f"   (nada que subir a {SCHEMA}.{table})")
@@ -226,6 +335,57 @@ MATVIEWS = [
     "mv_priority_counts", "mv_state_counts",
     "mv_top_parties", "mv_secured_parties", "mv_scraper_status",
 ]
+
+
+def load_swap(conn, table: str, cols: list[str], rows: list[dict]) -> None:
+    """
+    Carga a una tabla de staging y traslada el contenido a la definitiva al
+    final, sin que la webapp vea nunca una tabla vacía.
+
+    El problema que resuelve: recrear la tabla y cargarla directo la dejaba en 0
+    filas durante toda la carga — la app estuvo sin datos ~15 minutos.
+
+    POR QUÉ NO SE RENOMBRAN LAS TABLAS
+    ----------------------------------
+    La solución obvia sería cargar en `maestro__nuevo` y hacer
+    `RENAME maestro → viejo; RENAME nuevo → maestro`. No funciona: en Postgres
+    las vistas se enlazan al OID de la tabla, no a su nombre. Tras el rename,
+    maestro_live seguiría leyendo la tabla vieja, y el DROP de esa tabla se
+    llevaría por delante todas las vistas (maestro_live, las mv_* y las ocho de
+    public) con CASCADE.
+
+    Lo que se hace en cambio: la parte lenta —traer 532.167 filas por la red—
+    va a la tabla de staging, fuera del camino de nadie. Después, en UNA
+    transacción, se vacía la definitiva y se copia desde staging con un
+    INSERT ... SELECT, que es local al servidor y tarda segundos. La tabla
+    nunca cambia de identidad, así que las vistas no se enteran, y los lectores
+    solo esperan durante esa transacción corta en vez de ver datos vacíos.
+    """
+    tmp = f"{table}__staging"
+    col_list = ", ".join(f'"{c}"' for c in cols)
+
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {SCHEMA}.{tmp}")
+        # Sin índices: cargar sin ellos es más rápido y en staging no se consulta.
+        cur.execute(f"CREATE UNLOGGED TABLE {SCHEMA}.{tmp} "
+                    f"(LIKE {SCHEMA}.{table})")
+    conn.commit()
+
+    copy_into(conn, tmp, cols, rows)
+
+    print(f"   trasladando a {SCHEMA}.{table} (transacción corta)...")
+    t0 = time.time()
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {SCHEMA}.{table}")
+        cur.execute(f"INSERT INTO {SCHEMA}.{table} ({col_list}) "
+                    f"SELECT {col_list} FROM {SCHEMA}.{tmp}")
+        movidas = cur.rowcount
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE {SCHEMA}.{tmp}")
+    conn.commit()
+    print(f"   ✅ {SCHEMA}.{table}: {movidas:,} filas trasladadas en "
+          f"{time.time()-t0:.0f}s (la app no vio la tabla vacía)")
 
 
 def finalize(conn, tables: list[str]):
@@ -449,6 +609,10 @@ def main():
                     help="Aplicar supabase_schema.sql antes de cargar (VACÍA las tablas)")
     ap.add_argument("--schema-only", action="store_true",
                     help="Aplicar supabase_schema.sql y salir")
+    ap.add_argument("--upsert", action="store_true",
+                    help="Método viejo: upsert fila por fila en batches. Más "
+                         "lento y pesado para el servidor; solo para cargas "
+                         "parciales donde haya que preservar lo que ya está")
     ap.add_argument("--dry-run", action="store_true",
                     help="Extrae y arma todo pero no escribe en Supabase")
     args = ap.parse_args()
@@ -470,23 +634,30 @@ def main():
             return
 
     print(f"   Tablas:  {', '.join(targets)}")
-    print(f"   Batch:   {args.batch:,} filas")
+    print(f"   Método:  " + ("upsert por batches de "
+                             f"{args.batch:,}" if args.upsert
+                             else "COPY + staging con traslado atómico"))
 
     conn = open_db()
     t0 = time.time()
 
+    def cargar(table, cols, rows, pk):
+        if args.dry_run:
+            print(f"   (dry run: {len(rows):,} filas para {SCHEMA}.{table})")
+        elif args.upsert:
+            push(pg, table, cols, rows, pk, args.batch, args.dry_run)
+        else:
+            load_swap(pg, table, cols, rows)
+
     try:
         if "carriers" in targets:
-            push(pg, "carriers", CARRIER_COLS, extract_carriers(conn),
-                 "dot_number", args.batch, args.dry_run)
+            cargar("carriers", CARRIER_COLS, extract_carriers(conn), "dot_number")
 
         if "ucc_filings" in targets:
-            push(pg, "ucc_filings", UCC_COLS, extract_ucc(conn),
-                 "id", args.batch, args.dry_run)
+            cargar("ucc_filings", UCC_COLS, extract_ucc(conn), "id")
 
         if "maestro" in targets:
-            push(pg, "maestro", MAESTRO_COLS, build_maestro(conn),
-                 "dot_number", args.batch, args.dry_run)
+            cargar("maestro", MAESTRO_COLS, build_maestro(conn), "dot_number")
 
         if not args.dry_run:
             finalize(pg, targets)
