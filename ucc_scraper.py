@@ -52,6 +52,8 @@ import asyncio
 import httpx
 import sqlite3
 import duckdb
+
+from census_schema import CARRIER_COLS, sql_type
 import sys
 import time
 import json
@@ -268,28 +270,8 @@ SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
 
-CREATE TABLE IF NOT EXISTS carriers (
-    dot_number        TEXT PRIMARY KEY,
-    legal_name        TEXT,
-    dba_name          TEXT,
-    phy_state         TEXT,
-    phy_city          TEXT,
-    phy_street        TEXT,
-    phy_zip           TEXT,
-    phone             TEXT,
-    cell_phone        TEXT,
-    email_address     TEXT,
-    company_officer_1 TEXT,
-    power_units       INTEGER,
-    truck_units       INTEGER,
-    fleetsize         INTEGER,
-    total_drivers     INTEGER,
-    classdef          TEXT,
-    carrier_operation TEXT,
-    safety_rating     TEXT,
-    mcs150_date       TEXT,
-    status_code       TEXT
-);
+/* La tabla carriers la crea _carriers_ddl() desde census_schema: son 145
+   columnas y escribirlas aquí a mano garantizaba que se desincronizaran. */
 
 CREATE TABLE IF NOT EXISTS ucc_filings (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,18 +306,26 @@ CREATE TABLE IF NOT EXISTS scrape_log (
 );
 """
 
-CARRIER_COLS = [
-    "dot_number", "legal_name", "dba_name", "phy_state", "phy_city",
-    "phy_street", "phy_zip", "phone", "cell_phone", "email_address",
-    "company_officer_1", "power_units", "truck_units", "fleetsize",
-    "total_drivers", "classdef", "carrier_operation", "safety_rating",
-    "mcs150_date", "status_code",
-]
+def _carriers_ddl() -> str:
+    """CREATE TABLE de carriers armado desde census_schema, no a mano.
+
+    Son 145 columnas: escribirlas aquí y mantenerlas sincronizadas con los otros
+    scripts era pedir que alguna quedara desalineada.
+    """
+    defs = [f'    "{c}" {sql_type(c)}' + (" PRIMARY KEY" if c == "dot_number" else "")
+            for c in CARRIER_COLS]
+    return "CREATE TABLE IF NOT EXISTS carriers (\n" + ",\n".join(defs) + "\n);"
 
 
 def init_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.executescript(SCHEMA)
+    conn.executescript(_carriers_ddl())
+    # Tabla vieja de 20 columnas: se le agregan las que falten sin perder datos.
+    existentes = {r[1] for r in conn.execute("PRAGMA table_info(carriers)")}
+    for c in CARRIER_COLS:
+        if c not in existentes:
+            conn.execute(f'ALTER TABLE carriers ADD COLUMN "{c}" {sql_type(c)}')
     conn.commit()
     return conn
 
@@ -885,10 +875,15 @@ def main():
         sys.exit(1)
 
     conn = init_db(DB_FILE)
-    placeholders = ",".join("?" * len(CARRIER_COLS))
+    # Columnas explícitas, no VALUES posicional: el scraper solo trae las 20
+    # que necesita para consultar el registro, y la tabla tiene 145. Con
+    # posicional, los valores caerían en las columnas equivocadas.
+    cols = [c for c in CARRIER_COLS if c in carriers[0]]
+    placeholders = ",".join("?" * len(cols))
     conn.executemany(
-        f"INSERT OR IGNORE INTO carriers VALUES ({placeholders})",
-        [tuple(c.get(k) for k in CARRIER_COLS) for c in carriers]
+        f'INSERT OR IGNORE INTO carriers ({", ".join(chr(34)+c+chr(34) for c in cols)}) '
+        f"VALUES ({placeholders})",
+        [tuple(c.get(k) for k in cols) for c in carriers]
     )
     conn.commit()
     print(f"💾 {DB_FILE} inicializado con {len(carriers):,} carriers")

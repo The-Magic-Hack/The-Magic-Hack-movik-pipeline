@@ -39,20 +39,15 @@ except ImportError:
     print("Falta duckdb  →  pip install duckdb")
     sys.exit(1)
 
+from census_schema import CARRIER_COLS, INT_COLS, sql_type
+
 CSV_FILE = "census_file_full.csv"
 DB_FILE = "movik.db"
 
-# Mismo orden que el CREATE TABLE de ucc_scraper.py.
-CARRIER_COLS = [
-    "dot_number", "legal_name", "dba_name", "phy_state", "phy_city",
-    "phy_street", "phy_zip", "phone", "cell_phone", "email_address",
-    "company_officer_1", "power_units", "truck_units", "fleetsize",
-    "total_drivers", "classdef", "carrier_operation", "safety_rating",
-    "mcs150_date", "status_code",
-]
-
-# Enteros en el esquema; en el CSV vienen como texto (all_varchar).
-INT_COLS = {"power_units", "truck_units", "fleetsize", "total_drivers"}
+# CARRIER_COLS e INT_COLS salen de census_schema: son 145 columnas y tenerlas
+# duplicadas aquí era garantía de que tarde o temprano quedaran desalineadas
+# con el CREATE TABLE. En el CSV todo viene como texto (all_varchar); las de
+# INT_COLS se convierten al insertar.
 
 
 def to_int(value):
@@ -73,7 +68,7 @@ def load_from_csv(csv_path: str, states: list, limit=None) -> list:
     st_list = ", ".join(f"'{s}'" for s in states)
     lim = f"LIMIT {limit}" if limit else ""
     q = f"""
-        SELECT {', '.join(CARRIER_COLS)}
+        SELECT {', '.join(f'"{c}"' for c in CARRIER_COLS)}
         FROM read_csv_auto('{csv_path}', all_varchar=true,
                            header=true, ignore_errors=true)
         WHERE phy_state IN ({st_list})
@@ -134,6 +129,17 @@ def main():
         sys.exit(1)
 
     conn = sqlite3.connect(args.db)
+
+    # La tabla pudo crearse con las 20 columnas originales. Agrega las que
+    # falten sin tocar los datos ya cargados.
+    existentes = {r[1] for r in conn.execute("PRAGMA table_info(carriers)")}
+    nuevas = [c for c in CARRIER_COLS if c not in existentes]
+    for c in nuevas:
+        conn.execute(f'ALTER TABLE carriers ADD COLUMN "{c}" {sql_type(c)}')
+    if nuevas:
+        conn.commit()
+        print(f"   esquema: {len(nuevas)} columnas nuevas agregadas a carriers")
+
     before = {
         s: conn.execute(
             "SELECT COUNT(*) FROM carriers WHERE phy_state = ?", (s,)
@@ -155,10 +161,16 @@ def main():
             print(f"   --replace: {n:,} filas borradas de {s}")
 
     placeholders = ",".join("?" * len(CARRIER_COLS))
-    # INSERT OR IGNORE: dot_number es PK, así que re-correrlo es idempotente.
+    cols_sql = ", ".join(f'"{c}"' for c in CARRIER_COLS)
+    # Upsert, no INSERT OR IGNORE. Con IGNORE, un carrier que ya estaba en la
+    # tabla se saltaba entero: al agregar columnas nuevas al esquema, se
+    # habrían quedado en NULL para las 532.167 filas ya cargadas, y el script
+    # habría reportado "0 nuevos" como si todo estuviera bien.
+    updates = ", ".join(f'"{c}" = excluded."{c}"'
+                        for c in CARRIER_COLS if c != "dot_number")
     conn.executemany(
-        f"INSERT OR IGNORE INTO carriers ({', '.join(CARRIER_COLS)}) "
-        f"VALUES ({placeholders})",
+        f"INSERT INTO carriers ({cols_sql}) VALUES ({placeholders}) "
+        f"ON CONFLICT(dot_number) DO UPDATE SET {updates}",
         (normalize(r) for r in rows),
     )
     conn.commit()

@@ -133,15 +133,20 @@ porque "Triumph Business Capital" es un factor, no un banco.
 
 ## 4. Las tablas
 
-### `movik.carriers` — 532.167 filas
+### `movik.carriers` — 532.167 filas × 145 columnas
 
 Espejo del censo FMCSA, filtrado a los tres estados y a activos.
 
-`dot_number` (PK) · `legal_name` · `dba_name` · `phy_state` · `phy_city` ·
-`phy_street` · `phy_zip` · `phone` · `cell_phone` · `email_address` ·
-`company_officer_1` · `power_units` · `truck_units` · `fleetsize` ·
-`total_drivers` · `classdef` · `carrier_operation` · `safety_rating` ·
-`mcs150_date` · `status_code`
+Se guardan **145 de las 147 columnas** del censo. Las dos que faltan son
+`phy_barrio` y `mail_barrio`: campos de Puerto Rico, 0 filas con dato en los
+tres estados del proyecto.
+
+El detalle de qué significa cada una está en **[MAESTRO.md](MAESTRO.md)** —
+`maestro` incluye estas mismas columnas.
+
+La lista y los tipos viven en `census_schema.py`, que es de donde los leen
+`ucc_scraper.py`, `05_load_carriers_db.py` y `load_to_supabase.py`. No hay que
+escribirla en ningún otro lado.
 
 ### `movik.ucc_filings` — 258.883 filas
 
@@ -156,12 +161,16 @@ Un registro por gravamen. Un carrier puede tener varios.
 `match_found = 0` significa que se buscó y no se encontró nada — la fila existe
 como constancia de la búsqueda.
 
-### `movik.maestro` — 532.167 filas ⭐
+### `movik.maestro` — 532.167 filas × 162 columnas ⭐
 
 **Una fila por carrier, ya cruzada.** Es la tabla que hay que consultar para
 casi todo: no requiere joins y trae la prioridad calculada.
 
-Contiene todas las columnas de `carriers`, más:
+📖 **El diccionario completo, columna por columna, está en
+[MAESTRO.md](MAESTRO.md)**: qué significa cada una, cuán llena está y para qué
+sirve comercialmente.
+
+Contiene las 145 columnas del censo, más estas 17 del cruce:
 
 | Columna | Qué es |
 |---|---|

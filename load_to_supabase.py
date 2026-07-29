@@ -259,23 +259,18 @@ def open_db() -> sqlite3.Connection:
     return conn
 
 
-CARRIER_COLS = [
-    "dot_number", "legal_name", "dba_name", "phy_state", "phy_city", "phy_street",
-    "phy_zip", "phone", "cell_phone", "email_address", "company_officer_1",
-    "power_units", "truck_units", "fleetsize", "total_drivers", "classdef",
-    "carrier_operation", "safety_rating", "mcs150_date", "status_code",
-]
-INT_CARRIER_COLS = {"power_units", "truck_units", "fleetsize", "total_drivers"}
+from census_schema import CARRIER_COLS, INT_COLS as INT_CARRIER_COLS
 
 
 def extract_carriers(conn) -> list[dict]:
     print("\n📥 Leyendo carriers de movik.db...")
+    cols_sql = ", ".join(f'"{c}"' for c in CARRIER_COLS)
     rows = []
-    for r in conn.execute(f"SELECT {', '.join(CARRIER_COLS)} FROM carriers"):
+    for r in conn.execute(f"SELECT {cols_sql} FROM carriers"):
         d = {c: (to_int(r[c]) if c in INT_CARRIER_COLS else r[c]) for c in CARRIER_COLS}
         d["dot_number"] = str(d["dot_number"])
         rows.append(d)
-    print(f"   {len(rows):,} carriers")
+    print(f"   {len(rows):,} carriers ({len(CARRIER_COLS)} columnas)")
     return rows
 
 
@@ -331,12 +326,12 @@ WHERE u.match_found = 1
 GROUP BY u.dot_number;
 """
 
-MAESTRO_SELECT = """
+# El maestro lleva TODAS las columnas del censo más lo que sale del cruce con
+# UCC. Se arma desde CARRIER_COLS en vez de listarlas: con 145 nombres, una
+# lista escrita a mano se desalinea a la primera.
+MAESTRO_SELECT = f"""
 SELECT
-  c.dot_number, c.legal_name, c.dba_name, c.phy_state, c.phy_city, c.phy_street,
-  c.phy_zip, c.phone, c.cell_phone, c.email_address, c.company_officer_1,
-  c.power_units, c.truck_units, c.fleetsize, c.total_drivers,
-  c.classdef, c.carrier_operation, c.safety_rating, c.mcs150_date,
+  {', '.join(f'c."{c}"' for c in CARRIER_COLS)},
   s.status     AS log_status,
   s.error_msg  AS log_error,
   s.scraped_at AS log_scraped_at,
@@ -349,16 +344,14 @@ LEFT JOIN mv_rep     r  ON r.dot_number = c.dot_number
 LEFT JOIN ucc_filings f ON f.id = r.rep_id
 """
 
-MAESTRO_COLS = [
-    "dot_number", "legal_name", "dba_name", "phy_state", "phy_city", "phy_street",
-    "phy_zip", "phone", "cell_phone", "email_address", "company_officer_1",
-    "power_units", "truck_units", "fleetsize", "total_drivers", "units",
-    "classdef", "carrier_operation", "safety_rating", "mcs150_date",
-    "priority", "prio_rank", "ucc_found", "ucc_number", "date_filed",
+# Columnas que NO vienen del censo: las calcula este script al cruzar.
+MAESTRO_EXTRA = [
+    "units", "priority", "prio_rank", "ucc_found", "ucc_number", "date_filed",
     "expires_date", "expires_date_iso", "days_to_expiry", "secured_party",
     "secured_party_type", "filing_status", "state_registry", "n_filings",
     "scraped_at", "notes", "search_name",
 ]
+MAESTRO_COLS = CARRIER_COLS + MAESTRO_EXTRA
 
 
 def build_maestro(conn) -> list[dict]:
@@ -406,27 +399,16 @@ def build_maestro(conn) -> list[dict]:
         power = to_int(r["power_units"])
         truck = to_int(r["truck_units"])
 
+        # Las 145 del censo se copian tal cual; solo se normalizan las que el
+        # esquema declara enteras.
+        fila = {c: (to_int(r[c]) if c in INT_CARRIER_COLS else r[c])
+                for c in CARRIER_COLS}
+        fila["dot_number"] = str(r["dot_number"])
+        fila["phy_state"] = state
+
         rows.append({
-            "dot_number": str(r["dot_number"]),
-            "legal_name": r["legal_name"],
-            "dba_name": r["dba_name"],
-            "phy_state": state,
-            "phy_city": r["phy_city"],
-            "phy_street": r["phy_street"],
-            "phy_zip": r["phy_zip"],
-            "phone": r["phone"],
-            "cell_phone": r["cell_phone"],
-            "email_address": r["email_address"],
-            "company_officer_1": r["company_officer_1"],
-            "power_units": power,
-            "truck_units": truck,
-            "fleetsize": to_int(r["fleetsize"]),
-            "total_drivers": to_int(r["total_drivers"]),
+            **fila,
             "units": power if power else (truck if truck else 0),
-            "classdef": r["classdef"],
-            "carrier_operation": r["carrier_operation"],
-            "safety_rating": r["safety_rating"],
-            "mcs150_date": r["mcs150_date"],
             "priority": priority,
             "prio_rank": PRIORITY_RANK.get(priority, 9),
             "ucc_found": ucc_found,
