@@ -132,6 +132,13 @@ def connect_pg():
     conn = psycopg2.connect(dsn, connect_timeout=30)
     conn.autocommit = False
     with conn.cursor() as cur:
+        # Sin límite de tiempo por sentencia: un COPY de 532.167 filas tarda
+        # minutos y el statement_timeout que trae el rol lo cancelaba a mitad
+        # de camino (murió en la fila 350.572 de la primera prueba). Es seguro
+        # acotarlo solo aquí: esta sesión es la del cargador, no la de la app —
+        # anon sigue con sus 15s, que es lo que protege a la webapp.
+        cur.execute("SET statement_timeout = 0")
+        cur.execute("SET idle_in_transaction_session_timeout = 0")
         cur.execute("SELECT current_database(), current_user, version()")
         db, user, ver = cur.fetchone()
     print(f"   Conectado: {db} como {user}")
