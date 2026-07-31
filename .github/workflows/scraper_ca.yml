@@ -82,7 +82,13 @@ jobs:
       # ca_ucc_scraper.py NO acepta --state: es CA-only por diseño (pega contra
       # bizfileonline.sos.ca.gov). Sus flags son --test/--retry-errors/--reset/
       # --rate/--workers/--alerts-only.
+      # timeout en el PASO, no solo en el job: si el job se cancela por su
+      # propio timeout, los pasos siguientes no corren y la carga a Supabase se
+      # pierde, dejando lo scrapeado encerrado en el artifact.
       - name: Correr scraper CA
+        id: scrape
+        timeout-minutes: 320
+        continue-on-error: true
         run: |
           ARGS=""
           if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --test ${{ inputs.limit }}"; fi
@@ -102,8 +108,27 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+      # always(): lo scrapeado hasta el corte vale igual.
       - name: Cargar a Supabase (schema movik)
-        if: success()
+        if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python -u load_to_supabase.py --only ${{ inputs.tables }}
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "### Scraper CA" >> $GITHUB_STEP_SUMMARY
+          echo "- scraper: \`${{ steps.scrape.outcome }}\`" >> $GITHUB_STEP_SUMMARY
+          python - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import sqlite3
+          c = sqlite3.connect("movik.db")
+          hechos, tot = c.execute("""
+              SELECT SUM(CASE WHEN s.dot_number IS NOT NULL THEN 1 ELSE 0 END),
+                     COUNT(*)
+                FROM carriers c LEFT JOIN scrape_log s
+                  ON s.dot_number = c.dot_number
+               WHERE c.phy_state = 'CA'""").fetchone()
+          print(f"- CA: {hechos:,} de {tot:,} ({hechos/tot*100:.1f}%) — "
+                f"pendientes {tot-hechos:,}")
+          PY
