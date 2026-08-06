@@ -12,7 +12,26 @@ name: Scraper CA
 #    IP, asi que entre pasada y pasada hace falta enfriamiento de verdad — que
 #    es lo que sondea ca_resume.py antes de dejar arrancar al scraper.
 #
-# A ~3.000 por pasada y 4 pasadas al dia, el backfill son ~26 dias.
+# ESTADO: PARADO. SOLO DISPARO MANUAL.  (06/08/2026)
+# -------------------------------------------------
+# El plan de arriba —una pasada de ~3.000 cada 6 h, ~26 dias de backfill— no
+# sobrevivio al primer contacto. Run 31072263961: el sondeo estuvo 6 h enteras,
+# 37 intentos uno cada 10 min, y devolvio HTTP 403 las 37 veces. Cero carriers.
+# El ultimo scrape de CA habia sido 11 dias antes, asi que no es un rate-limit
+# transitorio: es un bloqueo persistente sobre la IP del runner.
+#
+# Lo que eso demuestra: el self-hosted arreglaba los minutos pero fijaba UNA
+# sola IP, que es justo el recurso escaso. Los runners de GitHub daban IP nueva
+# por run —lo que CA necesita— y salian caros en minutos. Se optimizo la
+# restriccion equivocada.
+#
+# El cron esta quitado a proposito. Encadenado, cada corrida ocupaba el runner
+# 6 h y golpeaba el portal 6 veces por hora sin conseguir nada, lo que muy
+# probablemente afianzaba el bloqueo. Para reanudar hace falta antes una via
+# real de rotacion de IP (proxies residenciales en ca_ucc_scraper.py, que es lo
+# que concluye el comentario de ca_ucc_scraper.py:544) o volver a runners de
+# GitHub con minutos de pago. Mientras tanto queda el disparo manual para
+# probar si el bloqueo se levanta.
 #
 # NADA DE `shell: bash` AQUI
 # --------------------------
@@ -23,9 +42,10 @@ name: Scraper CA
 # PowerShell, que es el default del runner en Windows y no depende del PATH.
 
 on:
-  schedule:
-    # Cada 6 h. Espaciado a proposito: es el enfriamiento entre bloqueos del WAF.
-    - cron: "0 */6 * * *"
+  # Sin `schedule` a proposito — ver ESTADO arriba. Para reactivarlo cuando haya
+  # rotacion de IP:
+  #   schedule:
+  #     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       cooldown:
