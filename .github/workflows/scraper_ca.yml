@@ -1,23 +1,41 @@
 name: Scraper CA
 
-# Manual por ahora. Cuando el backfill esté completo, agregar:
-#   schedule:
-#     - cron: "0 9 * * *"
+# CA corre en un runner SELF-HOSTED, no en los de GitHub. Dos razones:
+#
+# 1. Minutos. El backfill de CA son ~316.000 carriers a 0,4 req/s. En runners
+#    de GitHub eso pasa de 14.000 minutos, y el plan free de la org da 2.000 al
+#    mes. En self-hosted los minutos no se cobran.
+# 2. El WAF. Incapsula cuenta VOLUMEN, no velocidad: corta cerca de la request
+#    ~3.000 sea cual sea el rate (ver ca_ucc_scraper.py:109-112). Por eso cada
+#    corrida hace UNA pasada de ~3.000 carriers y sale; el cron trae la
+#    siguiente. Ojo con la contrapartida del self-hosted: siempre es la MISMA
+#    IP, asi que entre pasada y pasada hace falta enfriamiento de verdad — que
+#    es lo que sondea ca_resume.py antes de dejar arrancar al scraper.
+#
+# A ~3.000 por pasada y 4 pasadas al dia, el backfill son ~26 dias.
+
 on:
+  schedule:
+    # Cada 6 h. Espaciado a proposito: es el enfriamiento entre bloqueos del WAF.
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
-      limit:
-        description: "Correr solo N carriers (vacío = todos)"
+      cooldown:
+        description: "Minutos de enfriamiento antes del primer sondeo"
+        required: false
+        default: "0"
+      workers:
+        description: "Peticiones en paralelo (vacío = default del scraper)"
+        required: false
+        default: ""
+      rate:
+        description: "Techo de requests/segundo (vacío = default del scraper)"
         required: false
         default: ""
       retry_errors:
         description: "Reintentar los carriers que quedaron en error"
         type: boolean
         default: false
-      workers:
-        description: "Peticiones en paralelo (vacío = default del scraper)"
-        required: false
-        default: ""
       tables:
         description: "Tablas a recargar en Supabase"
         type: choice
@@ -30,98 +48,106 @@ concurrency:
   group: scraper-ca
   cancel-in-progress: false
 
-# El GITHUB_TOKEN por defecto no llega a la API de Actions, así que
-# `gh run list` / `gh run download` responden 403 y el run no encuentra el
-# movik.db del run anterior. contents:read es para el release db-seed.
 permissions:
   contents: read
-  actions: read
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
+    runs-on: [self-hosted, movik-ca]
+    # Tope generoso: en self-hosted no hay limite de 6 h de GitHub, y quien
+    # corta de verdad es el WAF. Esto solo evita un run colgado para siempre.
+    timeout-minutes: 600
+
+    # El runner es Windows: sin esto los `run:` se interpretan con PowerShell y
+    # la sintaxis de abajo (que es sh) revienta.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: pip
+          # movik.db vive FUERA del workspace (ver abajo), pero checkout borra
+          # los archivos sin seguimiento y se llevaria el checkpoint por delante.
+          clean: false
 
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Igual que en scraper_fl.yml: artifact del run anterior, y si no hay,
-      # el release "db-seed". Refrescar la semilla con:  bash seed_db.sh
-      - name: Recuperar movik.db
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # En self-hosted el estado NO viaja como artifact: son 300 MB de subida y
+      # bajada por pasada, y el disco del runner persiste entre runs. Se guarda
+      # fuera del workspace para que `checkout` no lo toque nunca.
+      - name: Recuperar movik.db del disco del runner
         run: |
-          # || true porque el step corre con `bash -e`: si gh falla, la
-          # asignación falla y el step muere antes de intentar el release.
-          PREV=$(gh run list --workflow=scraper_ca.yml --status=success \
-                   --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
-          if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-ca --dir .; then
-            echo "Estado restaurado del run $PREV"
+          ESTADO="$HOME/movik-state-ca"
+          mkdir -p "$ESTADO"
+          if [ -f "$ESTADO/movik.db" ]; then
+            cp "$ESTADO/movik.db" movik.db
+            [ -f "$ESTADO/ca_scraper_checkpoint.json" ] && \
+              cp "$ESTADO/ca_scraper_checkpoint.json" ca_scraper_checkpoint.json
+            echo "Estado restaurado de $ESTADO"
           else
-            echo "Sin artifact previo; bajando el release db-seed"
+            echo "Primera corrida en este runner: bajando el release db-seed"
             gh release download db-seed --pattern 'movik.db' --clobber
           fi
-          # Sin movik.db el scraper no tiene carriers que consultar y el run
-          # sería un no-op silencioso: mejor fallar aquí y decir por qué.
           if [ ! -f movik.db ]; then
-            echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
+            echo "::error::No hay estado local ni release db-seed. Corre seed_db.sh."
             exit 1
           fi
-          ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
+          ls -lh movik.db
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ca_ucc_scraper.py NO acepta --state: es CA-only por diseño (pega contra
-      # bizfileonline.sos.ca.gov). Sus flags son --test/--retry-errors/--reset/
-      # --rate/--workers/--alerts-only.
-      # timeout en el PASO, no solo en el job: si el job se cancela por su
-      # propio timeout, los pasos siguientes no corren y la carga a Supabase se
-      # pierde, dejando lo scrapeado encerrado en el artifact.
+      # Sin esto el scraper arranca contra una IP todavia marcada y lo unico que
+      # consigue es refrescar la marca. Sale 1 si tras 6 h sigue bloqueada: ahi
+      # el problema ya no es transitorio y hace falta rotar IP.
+      - name: Esperar via libre del portal
+        id: probe
+        run: |
+          python -u ca_resume.py --probe-only \
+            --cooldown "${{ inputs.cooldown || '0' }}"
+
       - name: Correr scraper CA
         id: scrape
-        timeout-minutes: 320
         continue-on-error: true
         run: |
           ARGS=""
-          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --test ${{ inputs.limit }}"; fi
           if [ -n "${{ inputs.workers }}" ]; then ARGS="$ARGS --workers ${{ inputs.workers }}"; fi
+          if [ -n "${{ inputs.rate }}" ]; then ARGS="$ARGS --rate ${{ inputs.rate }}"; fi
           if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
           echo "python ca_ucc_scraper.py $ARGS"
           python -u ca_ucc_scraper.py $ARGS
 
-      - name: Guardar movik.db + checkpoint
+      # Antes de cargar: si esto no corre, la pasada se pierde entera.
+      - name: Guardar estado en el disco del runner
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: movik-state-ca
-          path: |
-            movik.db
-            ca_scraper_checkpoint.json
-          retention-days: 90
-          if-no-files-found: warn
+        run: |
+          ESTADO="$HOME/movik-state-ca"
+          mkdir -p "$ESTADO"
+          cp movik.db "$ESTADO/movik.db"
+          [ -f ca_scraper_checkpoint.json ] && \
+            cp ca_scraper_checkpoint.json "$ESTADO/ca_scraper_checkpoint.json"
+          ls -lh "$ESTADO"
 
-      # always(): lo scrapeado hasta el corte vale igual.
+      # --state CA es obligatorio: este movik.db es el fork de CA y no tiene lo
+      # que el workflow de FL haya scrapeado en el suyo. Sin acotar, el
+      # reemplazo borraria de Supabase todo el avance de FL.
       - name: Cargar a Supabase (schema movik)
         if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: python -u load_to_supabase.py --only ${{ inputs.tables }}
+        run: python -u load_to_supabase.py --state CA --only ${{ inputs.tables || 'ucc_filings maestro' }}
 
       - name: Resumen
         if: always()
         run: |
           echo "### Scraper CA" >> $GITHUB_STEP_SUMMARY
+          echo "- sondeo:  \`${{ steps.probe.outcome }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- scraper: \`${{ steps.scrape.outcome }}\`" >> $GITHUB_STEP_SUMMARY
           python - <<'PY' >> $GITHUB_STEP_SUMMARY
-          import sqlite3
+          import json, sqlite3, pathlib
           c = sqlite3.connect("movik.db")
           hechos, tot = c.execute("""
               SELECT SUM(CASE WHEN s.dot_number IS NOT NULL THEN 1 ELSE 0 END),
@@ -131,4 +157,14 @@ jobs:
                WHERE c.phy_state = 'CA'""").fetchone()
           print(f"- CA: {hechos:,} de {tot:,} ({hechos/tot*100:.1f}%) — "
                 f"pendientes {tot-hechos:,}")
+          # El numero que decide si el plan aguanta: cuanto rindio ESTA pasada
+          # antes de que el WAF cortara. Si cae pasada a pasada, la IP se esta
+          # quemando y no hay cron que lo arregle.
+          ck = pathlib.Path("ca_scraper_checkpoint.json")
+          if ck.exists():
+              d = json.loads(ck.read_text())
+              print(f"- Esta pasada: {d.get('done', 0):,} carriers en "
+                    f"{d.get('elapsed_s', 0)/60:.0f} min · "
+                    f"WAF corto en la request #{d.get('waf_first_block_at_request')} · "
+                    f"abortada: {d.get('aborted')}")
           PY

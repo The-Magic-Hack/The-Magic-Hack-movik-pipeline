@@ -59,7 +59,7 @@ import time
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -345,6 +345,13 @@ def save_result(conn: sqlite3.Connection, r: ScrapeResult):
         conn.commit()
         return
 
+    # Fuera lo que este carrier tuviera de una consulta anterior. ucc_filings no
+    # tiene clave única —el id es AUTOINCREMENT— así que sin esto un re-scrape
+    # (modo incremental) duplicaría cada filing en vez de actualizarlo, y el
+    # maestro contaría dos veces el mismo gravamen. En el backfill cada DOT se
+    # consulta una sola vez y este DELETE no borra nada.
+    conn.execute("DELETE FROM ucc_filings WHERE dot_number = ?", (r.dot_number,))
+
     if r.match_found and r.filings:
         for f in r.filings:
             conn.execute("""
@@ -629,7 +636,8 @@ def load_ck(path: str) -> set:
     return set(json.loads(p.read_text())) if p.exists() else set()
 
 
-def load_done(ck_path: str, db_path: str, retry_errors: bool = False) -> set:
+def load_done(ck_path: str, db_path: str, retry_errors: bool = False,
+              refresh_days: Optional[int] = None) -> set:
     """
     DOTs que no hay que volver a consultar: el checkpoint JSON UNIDO a lo que
     ya registró scrape_log.
@@ -644,6 +652,12 @@ def load_done(ck_path: str, db_path: str, retry_errors: bool = False) -> set:
     scraper, mientras que scrape_log recoge también lo que hizo el de CA.
 
     Con --retry-errors los fallidos quedan fuera del conjunto para reintentarlos.
+
+    Con refresh_days=N salen también los consultados hace más de N días: es el
+    modo incremental. Un UCC no es un dato fijo —vence, se renueva, aparece uno
+    nuevo— así que un carrier consultado hace seis meses ya no dice la verdad.
+    El resto del pipeline no cambia: al salir de `done`, vuelven a la cola de
+    pendientes como cualquier carrier sin consultar.
     """
     done = load_ck(ck_path)
     if not Path(db_path).exists():
@@ -655,6 +669,14 @@ def load_done(ck_path: str, db_path: str, retry_errors: bool = False) -> set:
         if retry_errors:
             done -= {str(r[0]) for r in conn.execute(
                 "SELECT dot_number FROM scrape_log WHERE status = 'error'")}
+        if refresh_days:
+            corte = (datetime.now(timezone.utc)
+                     - timedelta(days=refresh_days)).isoformat()
+            caducados = {str(r[0]) for r in conn.execute(
+                "SELECT dot_number FROM scrape_log WHERE scraped_at < ?", (corte,))}
+            done -= caducados
+            print(f"🔄 Incremental: {len(caducados):,} carriers consultados hace "
+                  f"más de {refresh_days} días vuelven a la cola")
     except sqlite3.OperationalError as e:
         print(f"⚠️  No se pudo leer scrape_log de {db_path}: {e}")
     finally:
@@ -841,6 +863,9 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Borrar checkpoint")
     parser.add_argument("--retry-errors", action="store_true",
                         help="Reintentar solo los carriers que fallaron")
+    parser.add_argument("--refresh-older-than", type=int, metavar="D",
+                        help="Modo incremental: reconsultar los carriers cuyo "
+                             "último scrape tenga más de D días")
     parser.add_argument("--debug", nargs="+", metavar="NAME", help="Debug de un nombre")
     args = parser.parse_args()
 
@@ -888,7 +913,8 @@ def main():
     conn.commit()
     print(f"💾 {DB_FILE} inicializado con {len(carriers):,} carriers")
 
-    done = load_done(CHECKPOINT, DB_FILE, retry_errors=args.retry_errors)
+    done = load_done(CHECKPOINT, DB_FILE, retry_errors=args.retry_errors,
+                     refresh_days=args.refresh_older_than)
     asyncio.run(run(carriers, conn, CHECKPOINT, limit=args.test, done=done))
 
 

@@ -1,13 +1,19 @@
 name: Scraper FL
 
-# Manual por ahora. Cuando el backfill esté completo, agregar:
-#   schedule:
-#     - cron: "0 7 * * *"
+# Diario a las 07:00 UTC. Mientras quede backfill, cada corrida se lleva lo que
+# falte; cuando ya no quede, se convierte sola en el ciclo incremental — el
+# refresco por antigüedad (abajo) devuelve a la cola lo consultado hace mucho.
 on:
+  schedule:
+    - cron: "0 7 * * *"
   workflow_dispatch:
     inputs:
       limit:
         description: "Correr solo N carriers (vacío = todos)"
+        required: false
+        default: ""
+      refresh_older_than:
+        description: "Reconsultar lo scrapeado hace más de N días (vacío = 90)"
         required: false
         default: ""
       retry_errors:
@@ -94,6 +100,13 @@ jobs:
           ARGS="--states FL"
           if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --test ${{ inputs.limit }}"; fi
           if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
+          # En las corridas por cron `inputs` viene vacío, así que el default se
+          # pone aquí y no en el bloque de arriba. 90 días: un UCC vence, se
+          # renueva o aparece uno nuevo, y a los tres meses el dato guardado ya
+          # no es de fiar. Mientras quede backfill esto no cambia nada — los
+          # pendientes van primero igual.
+          REFRESH="${{ inputs.refresh_older_than }}"
+          ARGS="$ARGS --refresh-older-than ${REFRESH:-90}"
           echo "python ucc_scraper.py $ARGS"
           python -u ucc_scraper.py $ARGS
 
@@ -112,11 +125,14 @@ jobs:
 
       # always(): lo scrapeado hasta el corte vale igual, y si esto no corre los
       # datos se quedan encerrados en el artifact.
+      # --state FL es obligatorio: este movik.db viene del artifact movik-state-fl,
+      # que no tiene lo que el workflow de CA haya scrapeado en su propio fork.
+      # Sin acotar, el reemplazo borraria de Supabase todo el avance de CA.
       - name: Cargar a Supabase (schema movik)
         if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: python -u load_to_supabase.py --only ${{ inputs.tables }}
+        run: python -u load_to_supabase.py --state FL --only ${{ inputs.tables }}
 
       - name: Resumen
         if: always()

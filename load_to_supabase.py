@@ -163,6 +163,32 @@ def to_iso(mmddyyyy):
         return None
 
 
+def ensure_pg(conn):
+    """
+    Devuelve una conexión viva, reconectando si la anterior murió.
+
+    Entre tabla y tabla el script pasa minutos leyendo movik.db sin tocar la
+    red — build_maestro solo tarda varios minutos en armar 532.167 filas. El
+    pooler de Supabase cierra las conexiones ociosas en ese rato, y la carga
+    reventaba con "server closed the connection unexpectedly" justo al ir a
+    escribir la tabla siguiente, después de haber hecho todo el trabajo.
+    """
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.commit()
+            return conn
+        except psycopg2.Error:
+            print("   ⚠️  la conexión se cerró mientras se preparaban los datos; "
+                  "reconectando")
+            try:
+                conn.close()
+            except psycopg2.Error:
+                pass
+    return connect_pg()
+
+
 def to_int(v):
     if v in (None, ""):
         return None
@@ -344,7 +370,26 @@ MATVIEWS = [
 ]
 
 
-def load_swap(conn, table: str, cols: list[str], rows: list[dict]) -> None:
+def state_scope_sql(table: str, state: str) -> tuple[str, tuple]:
+    """
+    Predicado que acota el reemplazo a un solo estado.
+
+    carriers y maestro llevan phy_state propia. ucc_filings no —sus columnas son
+    las del filing, no las del carrier— así que se acota por los dot_number que
+    movik.carriers marca de ese estado. Eso obliga a que carriers esté cargada
+    con TODOS los estados, que es justo lo que garantiza el reemplazo acotado:
+    una carga de CA solo borra las filas de CA y deja FL en su sitio.
+    """
+    if table in ("carriers", "maestro"):
+        return 'WHERE "phy_state" = %s', (state,)
+    if table == "ucc_filings":
+        return (f'WHERE "dot_number" IN (SELECT "dot_number" FROM {SCHEMA}.carriers '
+                f'WHERE "phy_state" = %s)', (state,))
+    raise ValueError(f"no sé acotar {table} por estado")
+
+
+def load_swap(conn, table: str, cols: list[str], rows: list[dict],
+              state: str | None = None) -> None:
     """
     Carga a una tabla de staging y traslada el contenido a la definitiva al
     final, sin que la webapp vea nunca una tabla vacía.
@@ -367,6 +412,15 @@ def load_swap(conn, table: str, cols: list[str], rows: list[dict]) -> None:
     INSERT ... SELECT, que es local al servidor y tarda segundos. La tabla
     nunca cambia de identidad, así que las vistas no se enteran, y los lectores
     solo esperan durante esa transacción corta en vez de ver datos vacíos.
+
+    REEMPLAZO ACOTADO POR ESTADO (state=...)
+    ----------------------------------------
+    Sin `state` esto vacía la tabla entera y la repuebla desde el movik.db del
+    run. Eso era correcto mientras solo corría el scraper de FL, pero FL y CA
+    restauran artifacts distintos (movik-state-fl / movik-state-ca), o sea que
+    cada uno lleva su propio fork del movik.db. Con TRUNCATE, el segundo en
+    cargar borraba de Supabase todo lo que había scrapeado el otro. Con `state`
+    se borran solo las filas de ese estado y los demás quedan intactos.
     """
     tmp = f"{table}__staging"
     col_list = ", ".join(f'"{c}"' for c in cols)
@@ -380,10 +434,16 @@ def load_swap(conn, table: str, cols: list[str], rows: list[dict]) -> None:
 
     copy_into(conn, tmp, cols, rows)
 
-    print(f"   trasladando a {SCHEMA}.{table} (transacción corta)...")
+    alcance = f"solo {state}" if state else "tabla completa"
+    print(f"   trasladando a {SCHEMA}.{table} ({alcance}, transacción corta)...")
     t0 = time.time()
     with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {SCHEMA}.{table}")
+        if state:
+            where, params = state_scope_sql(table, state)
+            cur.execute(f"DELETE FROM {SCHEMA}.{table} {where}", params)
+            print(f"   {cur.rowcount:,} filas de {state} retiradas")
+        else:
+            cur.execute(f"TRUNCATE {SCHEMA}.{table}")
         cur.execute(f"INSERT INTO {SCHEMA}.{table} ({col_list}) "
                     f"SELECT {col_list} FROM {SCHEMA}.{tmp}")
         movidas = cur.rowcount
@@ -429,11 +489,12 @@ def open_db() -> sqlite3.Connection:
 from census_schema import CARRIER_COLS, INT_COLS as INT_CARRIER_COLS
 
 
-def extract_carriers(conn) -> list[dict]:
+def extract_carriers(conn, state: str | None = None) -> list[dict]:
     print("\n📥 Leyendo carriers de movik.db...")
     cols_sql = ", ".join(f'"{c}"' for c in CARRIER_COLS)
+    where, params = (" WHERE phy_state = ?", (state,)) if state else ("", ())
     rows = []
-    for r in conn.execute(f"SELECT {cols_sql} FROM carriers"):
+    for r in conn.execute(f"SELECT {cols_sql} FROM carriers{where}", params):
         d = {c: (to_int(r[c]) if c in INT_CARRIER_COLS else r[c]) for c in CARRIER_COLS}
         d["dot_number"] = str(d["dot_number"])
         rows.append(d)
@@ -449,10 +510,15 @@ UCC_COLS = [
 ]
 
 
-def extract_ucc(conn) -> list[dict]:
+def extract_ucc(conn, state: str | None = None) -> list[dict]:
     print("\n📥 Leyendo ucc_filings de movik.db...")
+    # ucc_filings no guarda el estado del carrier: se acota por los dot_number
+    # que carriers marca de ese estado, igual que del lado de Postgres.
+    where, params = ((" WHERE dot_number IN (SELECT dot_number FROM carriers "
+                      "WHERE phy_state = ?)", (state,)) if state else ("", ()))
     rows = []
-    for r in conn.execute(f"SELECT {', '.join(UCC_COLS)} FROM ucc_filings"):
+    for r in conn.execute(
+            f"SELECT {', '.join(UCC_COLS)} FROM ucc_filings{where}", params):
         d = {c: r[c] for c in UCC_COLS}
         d["id"] = int(d["id"])
         d["dot_number"] = str(d["dot_number"])
@@ -521,12 +587,13 @@ MAESTRO_EXTRA = [
 MAESTRO_COLS = CARRIER_COLS + MAESTRO_EXTRA
 
 
-def build_maestro(conn) -> list[dict]:
+def build_maestro(conn, state: str | None = None) -> list[dict]:
     print("\n📥 Construyendo el maestro (carriers × scrape_log × UCC)...")
     conn.executescript(MAESTRO_SQL)
 
+    where, params = (" WHERE c.phy_state = ?", (state,)) if state else ("", ())
     rows = []
-    for r in conn.execute(MAESTRO_SELECT):
+    for r in conn.execute(MAESTRO_SELECT + where, params):
         state = (r["phy_state"] or "").strip()
         status = r["log_status"]
 
@@ -611,6 +678,11 @@ def main():
     ap.add_argument("--only", nargs="+", metavar="T",
                     choices=["carriers", "ucc_filings", "maestro"],
                     help="Cargar solo estas tablas")
+    ap.add_argument("--state", metavar="XX",
+                    help="Reemplazar solo las filas de este estado (ej. FL, CA). "
+                         "Obligatorio cuando el movik.db del run solo trae ese "
+                         "estado al día: sin esto se borra de Supabase lo que "
+                         "haya scrapeado el otro workflow")
     ap.add_argument("--batch", type=int, default=BATCH_SIZE, metavar="N")
     ap.add_argument("--init-schema", action="store_true",
                     help="Aplicar supabase_schema.sql antes de cargar (VACÍA las tablas)")
@@ -625,9 +697,11 @@ def main():
     args = ap.parse_args()
 
     targets = args.only or ["carriers", "ucc_filings", "maestro"]
+    state = args.state.strip().upper() if args.state else None
 
     print(f"\n🚀 Movik → Supabase  ·  schema \"{SCHEMA}\"")
     print(f"   Origen:  {DB_FILE}")
+    print(f"   Alcance: {state if state else 'TODOS los estados (reemplazo total)'}")
     if args.dry_run:
         print("   ⚠️  DRY RUN: no se escribe nada")
 
@@ -649,24 +723,30 @@ def main():
     t0 = time.time()
 
     def cargar(table, cols, rows, pk):
+        nonlocal pg
         if args.dry_run:
             print(f"   (dry run: {len(rows):,} filas para {SCHEMA}.{table})")
-        elif args.upsert:
+            return
+        # Se comprueba DESPUÉS de armar las filas: es ahí donde se van los
+        # minutos que dejan morir la conexión.
+        pg = ensure_pg(pg)
+        if args.upsert:
             push(pg, table, cols, rows, pk, args.batch, args.dry_run)
         else:
-            load_swap(pg, table, cols, rows)
+            load_swap(pg, table, cols, rows, state)
 
     try:
         if "carriers" in targets:
-            cargar("carriers", CARRIER_COLS, extract_carriers(conn), "dot_number")
+            cargar("carriers", CARRIER_COLS, extract_carriers(conn, state), "dot_number")
 
         if "ucc_filings" in targets:
-            cargar("ucc_filings", UCC_COLS, extract_ucc(conn), "id")
+            cargar("ucc_filings", UCC_COLS, extract_ucc(conn, state), "id")
 
         if "maestro" in targets:
-            cargar("maestro", MAESTRO_COLS, build_maestro(conn), "dot_number")
+            cargar("maestro", MAESTRO_COLS, build_maestro(conn, state), "dot_number")
 
         if not args.dry_run:
+            pg = ensure_pg(pg)
             finalize(pg, targets)
     finally:
         conn.close()
