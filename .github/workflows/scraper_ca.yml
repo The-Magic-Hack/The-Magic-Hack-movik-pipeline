@@ -1,6 +1,6 @@
 name: Scraper CA
 
-# CA corre en un runner SELF-HOSTED, no en los de GitHub. Dos razones:
+# CA corre en un runner SELF-HOSTED Windows, no en los de GitHub. Dos razones:
 #
 # 1. Minutos. El backfill de CA son ~316.000 carriers a 0,4 req/s. En runners
 #    de GitHub eso pasa de 14.000 minutos, y el plan free de la org da 2.000 al
@@ -13,6 +13,14 @@ name: Scraper CA
 #    es lo que sondea ca_resume.py antes de dejar arrancar al scraper.
 #
 # A ~3.000 por pasada y 4 pasadas al dia, el backfill son ~26 dias.
+#
+# NADA DE `shell: bash` AQUI
+# --------------------------
+# En este runner `bash` resuelve a C:\WINDOWS\system32\bash.EXE, que es el stub
+# de WSL, y sin distribucion instalada revienta con "Windows Subsystem for Linux
+# has no installed distributions". En los runners de GitHub el bash de Git for
+# Windows va primero en el PATH; aqui gana system32. Los pasos van en
+# PowerShell, que es el default del runner en Windows y no depende del PATH.
 
 on:
   schedule:
@@ -51,54 +59,58 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Fuera del workspace: `checkout` limpia el suyo y se llevaria el estado por
+  # delante. Ruta absoluta y fuera de C:\Users para que funcione sea cual sea la
+  # cuenta con la que corra el servicio del runner.
+  ESTADO: C:\movik-state\ca
+
 jobs:
   scrape:
     runs-on: [self-hosted, movik-ca]
-    # Tope generoso: en self-hosted no hay limite de 6 h de GitHub, y quien
-    # corta de verdad es el WAF. Esto solo evita un run colgado para siempre.
+    # En self-hosted no hay limite de 6 h de GitHub, y quien corta de verdad es
+    # el WAF. Esto solo evita un run colgado para siempre.
     timeout-minutes: 600
-
-    # El runner es Windows: sin esto los `run:` se interpretan con PowerShell y
-    # la sintaxis de abajo (que es sh) revienta.
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - uses: actions/checkout@v4
         with:
-          # movik.db vive FUERA del workspace (ver abajo), pero checkout borra
-          # los archivos sin seguimiento y se llevaria el checkpoint por delante.
           clean: false
+
+      # Falla temprano y diciendo por que. Si el servicio del runner corre como
+      # NETWORK SERVICE no ve el Python instalado por usuario, y sin esto el
+      # error aparece tres pasos mas abajo disfrazado de otra cosa.
+      - name: Comprobar Python
+        run: |
+          $py = Get-Command python -ErrorAction SilentlyContinue
+          if (-not $py) {
+            Write-Output "::error::python no esta en el PATH de la cuenta del runner ($env:USERNAME). Python esta instalado por usuario; configura el servicio del runner para que corra como ese usuario, o instala Python para todos los usuarios."
+            exit 1
+          }
+          Write-Output "python: $($py.Source)"
+          python --version
+          Write-Output "cuenta del runner: $env:USERDOMAIN\$env:USERNAME"
 
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # En self-hosted el estado NO viaja como artifact: son 300 MB de subida y
-      # bajada por pasada, y el disco del runner persiste entre runs. Se guarda
-      # fuera del workspace para que `checkout` no lo toque nunca.
+      # El estado persiste en el disco del runner: son 300 MB y subirlos y
+      # bajarlos como artifact en cada pasada es tiempo tirado. El directorio se
+      # siembra una vez (copiando un movik.db al dia) y de ahi en adelante lo
+      # mantiene el paso de guardado.
       - name: Recuperar movik.db del disco del runner
         run: |
-          ESTADO="$HOME/movik-state-ca"
-          mkdir -p "$ESTADO"
-          if [ -f "$ESTADO/movik.db" ]; then
-            cp "$ESTADO/movik.db" movik.db
-            [ -f "$ESTADO/ca_scraper_checkpoint.json" ] && \
-              cp "$ESTADO/ca_scraper_checkpoint.json" ca_scraper_checkpoint.json
-            echo "Estado restaurado de $ESTADO"
-          else
-            echo "Primera corrida en este runner: bajando el release db-seed"
-            gh release download db-seed --pattern 'movik.db' --clobber
-          fi
-          if [ ! -f movik.db ]; then
-            echo "::error::No hay estado local ni release db-seed. Corre seed_db.sh."
+          if (-not (Test-Path "$env:ESTADO\movik.db")) {
+            Write-Output "::error::No hay movik.db en $env:ESTADO. Siembra el directorio copiando alli un movik.db al dia (o corre seed_db.sh)."
             exit 1
-          fi
-          ls -lh movik.db
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          }
+          Copy-Item "$env:ESTADO\movik.db" movik.db -Force
+          $ck = "$env:ESTADO\ca_scraper_checkpoint.json"
+          if (Test-Path $ck) { Copy-Item $ck ca_scraper_checkpoint.json -Force }
+          Write-Output "Estado restaurado de $env:ESTADO"
+          Get-Item movik.db | Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table
 
       # Sin esto el scraper arranca contra una IP todavia marcada y lo unico que
       # consigue es refrescar la marca. Sale 1 si tras 6 h sigue bloqueada: ahi
@@ -106,30 +118,31 @@ jobs:
       - name: Esperar via libre del portal
         id: probe
         run: |
-          python -u ca_resume.py --probe-only \
-            --cooldown "${{ inputs.cooldown || '0' }}"
+          $cd = if ("${{ inputs.cooldown }}") { "${{ inputs.cooldown }}" } else { "0" }
+          python -u ca_resume.py --probe-only --cooldown $cd
 
       - name: Correr scraper CA
         id: scrape
         continue-on-error: true
         run: |
-          ARGS=""
-          if [ -n "${{ inputs.workers }}" ]; then ARGS="$ARGS --workers ${{ inputs.workers }}"; fi
-          if [ -n "${{ inputs.rate }}" ]; then ARGS="$ARGS --rate ${{ inputs.rate }}"; fi
-          if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
-          echo "python ca_ucc_scraper.py $ARGS"
-          python -u ca_ucc_scraper.py $ARGS
+          $a = @()
+          if ("${{ inputs.workers }}") { $a += @("--workers", "${{ inputs.workers }}") }
+          if ("${{ inputs.rate }}")    { $a += @("--rate",    "${{ inputs.rate }}") }
+          if ("${{ inputs.retry_errors }}" -eq "true") { $a += "--retry-errors" }
+          Write-Output "python ca_ucc_scraper.py $a"
+          python -u ca_ucc_scraper.py @a
 
       # Antes de cargar: si esto no corre, la pasada se pierde entera.
       - name: Guardar estado en el disco del runner
         if: always()
         run: |
-          ESTADO="$HOME/movik-state-ca"
-          mkdir -p "$ESTADO"
-          cp movik.db "$ESTADO/movik.db"
-          [ -f ca_scraper_checkpoint.json ] && \
-            cp ca_scraper_checkpoint.json "$ESTADO/ca_scraper_checkpoint.json"
-          ls -lh "$ESTADO"
+          if (-not (Test-Path movik.db)) { Write-Output "Sin movik.db, nada que guardar"; exit 0 }
+          New-Item -ItemType Directory -Force -Path $env:ESTADO | Out-Null
+          Copy-Item movik.db "$env:ESTADO\movik.db" -Force
+          if (Test-Path ca_scraper_checkpoint.json) {
+            Copy-Item ca_scraper_checkpoint.json "$env:ESTADO\ca_scraper_checkpoint.json" -Force
+          }
+          Get-ChildItem $env:ESTADO | Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table
 
       # --state CA es obligatorio: este movik.db es el fork de CA y no tiene lo
       # que el workflow de FL haya scrapeado en el suyo. Sin acotar, el
@@ -138,33 +151,14 @@ jobs:
         if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: python -u load_to_supabase.py --state CA --only ${{ inputs.tables || 'ucc_filings maestro' }}
+        run: |
+          $t = if ("${{ inputs.tables }}") { "${{ inputs.tables }}" } else { "ucc_filings maestro" }
+          python -u load_to_supabase.py --state CA --only $t.Split(" ")
 
       - name: Resumen
         if: always()
         run: |
-          echo "### Scraper CA" >> $GITHUB_STEP_SUMMARY
-          echo "- sondeo:  \`${{ steps.probe.outcome }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- scraper: \`${{ steps.scrape.outcome }}\`" >> $GITHUB_STEP_SUMMARY
-          python - <<'PY' >> $GITHUB_STEP_SUMMARY
-          import json, sqlite3, pathlib
-          c = sqlite3.connect("movik.db")
-          hechos, tot = c.execute("""
-              SELECT SUM(CASE WHEN s.dot_number IS NOT NULL THEN 1 ELSE 0 END),
-                     COUNT(*)
-                FROM carriers c LEFT JOIN scrape_log s
-                  ON s.dot_number = c.dot_number
-               WHERE c.phy_state = 'CA'""").fetchone()
-          print(f"- CA: {hechos:,} de {tot:,} ({hechos/tot*100:.1f}%) — "
-                f"pendientes {tot-hechos:,}")
-          # El numero que decide si el plan aguanta: cuanto rindio ESTA pasada
-          # antes de que el WAF cortara. Si cae pasada a pasada, la IP se esta
-          # quemando y no hay cron que lo arregle.
-          ck = pathlib.Path("ca_scraper_checkpoint.json")
-          if ck.exists():
-              d = json.loads(ck.read_text())
-              print(f"- Esta pasada: {d.get('done', 0):,} carriers en "
-                    f"{d.get('elapsed_s', 0)/60:.0f} min · "
-                    f"WAF corto en la request #{d.get('waf_first_block_at_request')} · "
-                    f"abortada: {d.get('aborted')}")
-          PY
+          "### Scraper CA"                            | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- sondeo:  ``${{ steps.probe.outcome }}``"  | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "- scraper: ``${{ steps.scrape.outcome }}``" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          python ca_progress.py | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
