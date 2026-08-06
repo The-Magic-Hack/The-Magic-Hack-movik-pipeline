@@ -72,6 +72,17 @@ jobs:
     # el WAF. Esto solo evita un run colgado para siempre.
     timeout-minutes: 600
 
+    # -ExecutionPolicy Bypass, o el job no arranca. El runner escribe cada paso
+    # a un .ps1 en _temp y lo invoca con dot-sourcing; en esta maquina la
+    # directiva de LocalMachine esta Undefined —o sea Restricted— y cargar ese
+    # archivo da "running scripts is disabled on this system". El usuario tiene
+    # RemoteSigned, pero eso solo vale si el servicio corre con SU cuenta.
+    # Bypass aqui lo hace independiente de la cuenta y no cambia nada global,
+    # que es preferible a un Set-ExecutionPolicy con admin sobre la maquina.
+    defaults:
+      run:
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
+
     steps:
       - uses: actions/checkout@v4
         with:
