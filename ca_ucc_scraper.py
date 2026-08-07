@@ -431,12 +431,39 @@ def save_batch(conn: sqlite3.Connection, results: list):
 # ────────────────────────────────────────────────────────────────────────────
 # CARRIERS
 # ────────────────────────────────────────────────────────────────────────────
+def load_carriers_from_db() -> list:
+    """
+    Lee (dot, legal_name) de la tabla carriers de movik.db.
+
+    Es la fuente por defecto desde que CA corre en GitHub Actions: el xlsx pesa
+    127 MB, esta en .gitignore y no existe en el runner, asi que load_carriers()
+    reventaba en openpyxl antes de la primera request — y `continue-on-error`
+    lo pintaba de verde, con lo que el run terminaba en success habiendo hecho
+    cero carriers.
+
+    movik.db ya viaja al runner (cifrado) y tiene el censo completo, asi que es
+    la misma lista sin archivo extra que arrastrar.
+    """
+    conn = sqlite3.connect(str(DB_FILE))
+    try:
+        rows = [(str(d), n) for d, n in conn.execute(
+            "SELECT dot_number, legal_name FROM carriers "
+            "WHERE phy_state = ? AND legal_name IS NOT NULL AND legal_name <> ''",
+            (STATE,))]
+    finally:
+        conn.close()
+    log(f"[carriers] {len(rows):,} de {STATE} desde {DB_FILE.name}")
+    return rows
+
+
 def load_carriers() -> list:
     """
-    Lee la hoja 'CA' de movik_carriers.xlsx. El archivo pesa 127 MB, asi que
-    streameamos con openpyxl read_only y cacheamos (dot, name) en un CSV: la
-    primera pasada tarda minutos, las siguientes son instantaneas.
+    Lista de carriers de CA. Por defecto sale de movik.db; el xlsx solo se usa
+    si esta presente, que es el caso en local donde ya estaba cacheado.
     """
+    if not XLSX_FILE.exists():
+        return load_carriers_from_db()
+
     if CARRIER_CACHE.exists() and CARRIER_CACHE.stat().st_mtime >= XLSX_FILE.stat().st_mtime:
         with open(CARRIER_CACHE, newline="", encoding="utf-8") as fh:
             rows = [(r[0], r[1]) for r in csv.reader(fh)]

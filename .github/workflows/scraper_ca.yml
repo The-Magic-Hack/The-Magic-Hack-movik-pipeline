@@ -152,6 +152,32 @@ jobs:
           echo "python ca_ucc_scraper.py $ARGS"
           python -u ca_ucc_scraper.py $ARGS
 
+      # `continue-on-error` en el paso de arriba es necesario —que el WAF corte
+      # es el final normal de una pasada, no un fallo— pero convierte CUALQUIER
+      # muerte en un `success` verde. Asi paso desapercibido que el scraper
+      # reventaba en 0,2 s buscando un xlsx que no existe en el runner: el run
+      # entero salio en verde con cero carriers hechos.
+      #
+      # La distincion que importa no es exito/fallo sino si la pasada AVANZO.
+      # Si el scraper murio sin procesar a nadie, esto para el job en rojo.
+      - name: Comprobar que la pasada avanzo
+        if: always()
+        run: |
+          if [ ! -f ca_scraper_checkpoint.json ]; then
+            echo "::error::El scraper no dejo checkpoint: murio antes de empezar. Outcome: ${{ steps.scrape.outcome }}"
+            exit 1
+          fi
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("ca_scraper_checkpoint.json", encoding="utf-8"))
+          done = d.get("done", 0)
+          print(f"pasada: {done:,} carriers | abortada por WAF: {d.get('aborted')}")
+          if done == 0:
+              print("::error::La pasada no proceso ningun carrier. "
+                    "No es un corte del WAF: es un fallo real del scraper.")
+              sys.exit(1)
+          PY
+
       - name: Cifrar el estado
         if: always() && hashFiles('movik.db') != ''
         env:
