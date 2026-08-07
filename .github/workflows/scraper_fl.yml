@@ -40,6 +40,9 @@ permissions:
   contents: read
   actions: read
 
+env:
+  ESTADO_ENC: movik-state-fl.gz.enc
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -64,10 +67,15 @@ jobs:
       # siguiente. Si no hay run previo (el primero, o los artifacts vencieron)
       # cae al release "db-seed", que es la copia semilla con el censo cargado.
       # Para refrescar esa semilla:  bash seed_db.sh
-      - name: Recuperar movik.db
+      - name: Recuperar y descifrar movik.db
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
+          if [ -z "$STATE_KEY" ]; then
+            echo "::error::Falta el secret STATE_KEY. Settings → Secrets and variables → Actions."
+            exit 1
+          fi
           # || true porque el step corre con `bash -e`: si gh falla, la
           # asignación falla y el step muere antes de intentar el release.
           PREV=$(gh run list --workflow=scraper_fl.yml --status=success \
@@ -75,15 +83,18 @@ jobs:
           if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-fl --dir .; then
             echo "Estado restaurado del run $PREV"
           else
-            echo "Sin artifact previo; bajando el release db-seed"
-            gh release download db-seed --pattern 'movik.db' --clobber
+            echo "Sin artifact previo; bajando la semilla cifrada del release db-seed"
+            gh release download db-seed --pattern "$ESTADO_ENC" --clobber
           fi
-          # Sin movik.db el scraper no tiene carriers que consultar y el run
-          # sería un no-op silencioso: mejor fallar aquí y decir por qué.
-          if [ ! -f movik.db ]; then
-            echo "::error::No hay artifact previo ni release db-seed. Corre seed_db.sh."
+
+          if [ ! -f "$ESTADO_ENC" ]; then
+            echo "::error::No hay estado cifrado ni semilla. Sube $ESTADO_ENC al release db-seed."
             exit 1
           fi
+
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$ESTADO_ENC" -pass env:STATE_KEY | gunzip > movik.db
+          rm -f "$ESTADO_ENC"
           ls -lh movik.db scraper_checkpoint.json 2>/dev/null || true
 
       # Sin esto el ciclo incremental solo re-consultaria carriers que ya
@@ -146,17 +157,31 @@ jobs:
 
       # Se guarda aunque el scraper falle a mitad: el checkpoint y las filas ya
       # escritas valen igual, y perderlos obligaría a re-scrapear todo.
-      # census_state.json viaja con el estado: es el watermark del censo. Si se
-      # pierde, el paso del censo lo reconstruye desde movik.db, pero entonces
-      # se re-descargan los deltas ya aplicados — barato, aunque evitable.
-      # census_delta.csv NO se guarda: es de usar y tirar, ya esta en movik.db.
-      - name: Guardar movik.db + checkpoint
+      # El repo esta publico mientras dura el backfill de CA, y los artifacts de
+      # un repo publico los descarga cualquiera. movik.db son 532.167 carriers y
+      # los filings UCC cruzados y priorizados — el producto. Se cifra antes de
+      # subirlo: el artifact es un blob inutil sin STATE_KEY. Se comprime ANTES
+      # de cifrar porque lo cifrado ya no comprime.
+      - name: Cifrar el estado
+        if: always() && hashFiles('movik.db') != ''
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          gzip -c movik.db \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+                -out "$ESTADO_ENC" -pass env:STATE_KEY
+          ls -lh "$ESTADO_ENC"
+
+      # El checkpoint y el watermark van en claro: son numeros DOT (que el FMCSA
+      # publica) y una fecha. Revelan cobertura, no el cruce con UCC, que es lo
+      # que hay que proteger. census_delta.csv NO se guarda: es de usar y tirar.
+      - name: Guardar estado cifrado
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: movik-state-fl
           path: |
-            movik.db
+            movik-state-fl.gz.enc
             scraper_checkpoint.json
             census_state.json
           retention-days: 90
@@ -171,7 +196,10 @@ jobs:
         if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: python -u load_to_supabase.py --state FL --only ${{ inputs.tables }}
+        # `|| default`: en las corridas por cron `inputs` viene vacio, y sin esto
+        # el argumento quedaba en `--only` pelado — argparse aborta con "expected
+        # at least one argument" y la pasada no llegaba a Supabase.
+        run: python -u load_to_supabase.py --state FL --only ${{ inputs.tables || 'ucc_filings maestro' }}
 
       - name: Resumen
         if: always()

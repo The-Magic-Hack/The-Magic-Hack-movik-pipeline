@@ -2,6 +2,7 @@
 # pip install -r requirements.txt
 
 # Data pull & processing
+requests>=2.31              # pull del censo FMCSA (01_census_incremental.py)
 httpx[http2]>=0.27          # cliente HTTP async (el corazón del scraper)
 beautifulsoup4>=4.12        # parser HTML
 lxml>=5.0                   # backend rápido para bs4

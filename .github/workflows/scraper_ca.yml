@@ -1,51 +1,35 @@
 name: Scraper CA
 
-# CA corre en un runner SELF-HOSTED Windows, no en los de GitHub. Dos razones:
+# CA corre en runners de GitHub, y eso es deliberado: lo que el backfill
+# necesita no son minutos sino IPs.
 #
-# 1. Minutos. El backfill de CA son ~316.000 carriers a 0,4 req/s. En runners
-#    de GitHub eso pasa de 14.000 minutos, y el plan free de la org da 2.000 al
-#    mes. En self-hosted los minutos no se cobran.
-# 2. El WAF. Incapsula cuenta VOLUMEN, no velocidad: corta cerca de la request
-#    ~3.000 sea cual sea el rate (ver ca_ucc_scraper.py:109-112). Por eso cada
-#    corrida hace UNA pasada de ~3.000 carriers y sale; el cron trae la
-#    siguiente. Ojo con la contrapartida del self-hosted: siempre es la MISMA
-#    IP, asi que entre pasada y pasada hace falta enfriamiento de verdad — que
-#    es lo que sondea ca_resume.py antes de dejar arrancar al scraper.
+# HISTORIA, PARA NO REPETIRLA
+# ---------------------------
+# Primero se monto en un runner self-hosted, buscando minutos gratis. Fallo:
+# run 31072263961 sondeo 6 h seguidas, 37 intentos uno cada 10 min, HTTP 403 las
+# 37 veces, cero carriers — y el ultimo scrape habia sido 11 dias antes. El WAF
+# de Incapsula no limita ritmo sino identidad (ver ca_ucc_scraper.py:544), asi
+# que una IP fija no sirve por barata que salga. Cada run de GitHub trae IP
+# nueva, que es justo el recurso escaso.
 #
-# ESTADO: PARADO. SOLO DISPARO MANUAL.  (06/08/2026)
-# -------------------------------------------------
-# El plan de arriba —una pasada de ~3.000 cada 6 h, ~26 dias de backfill— no
-# sobrevivio al primer contacto. Run 31072263961: el sondeo estuvo 6 h enteras,
-# 37 intentos uno cada 10 min, y devolvio HTTP 403 las 37 veces. Cero carriers.
-# El ultimo scrape de CA habia sido 11 dias antes, asi que no es un rate-limit
-# transitorio: es un bloqueo persistente sobre la IP del runner.
+# EL ESTADO VIAJA CIFRADO
+# -----------------------
+# El repo esta publico mientras dure el backfill, para que estos runners no
+# cuesten minutos. Pero los artifacts de un repo publico los descarga
+# cualquiera, y movik.db son 532.167 carriers y 365.854 filings UCC cruzados y
+# priorizados — el producto, no un dato publico cualquiera. Asi que el estado se
+# comprime y se cifra con AES-256 antes de subirlo: el artifact es un blob
+# inutil sin STATE_KEY. Se comprime ANTES de cifrar porque lo cifrado ya no
+# comprime: al reves el artifact pasaria de ~99 MB a ~304 MB en cada run.
 #
-# Lo que eso demuestra: el self-hosted arreglaba los minutos pero fijaba UNA
-# sola IP, que es justo el recurso escaso. Los runners de GitHub daban IP nueva
-# por run —lo que CA necesita— y salian caros en minutos. Se optimizo la
-# restriccion equivocada.
-#
-# El cron esta quitado a proposito. Encadenado, cada corrida ocupaba el runner
-# 6 h y golpeaba el portal 6 veces por hora sin conseguir nada, lo que muy
-# probablemente afianzaba el bloqueo. Para reanudar hace falta antes una via
-# real de rotacion de IP (proxies residenciales en ca_ucc_scraper.py, que es lo
-# que concluye el comentario de ca_ucc_scraper.py:544) o volver a runners de
-# GitHub con minutos de pago. Mientras tanto queda el disparo manual para
-# probar si el bloqueo se levanta.
-#
-# NADA DE `shell: bash` AQUI
-# --------------------------
-# En este runner `bash` resuelve a C:\WINDOWS\system32\bash.EXE, que es el stub
-# de WSL, y sin distribucion instalada revienta con "Windows Subsystem for Linux
-# has no installed distributions". En los runners de GitHub el bash de Git for
-# Windows va primero en el PATH; aqui gana system32. Los pasos van en
-# PowerShell, que es el default del runner en Windows y no depende del PATH.
+# Al terminar el backfill, volver el repo a privado.
 
 on:
-  # Sin `schedule` a proposito — ver ESTADO arriba. Para reactivarlo cuando haya
-  # rotacion de IP:
-  #   schedule:
-  #     - cron: "0 */6 * * *"
+  schedule:
+    # Cada 3 h. Una pasada dura ~2,3 h (la corta el WAF cerca de la request
+    # ~3.000), asi que 3 h es lo mas apretado que se puede sin solaparse.
+    # 8 pasadas/dia x ~3.000 = ~24.000/dia -> los 316.580 pendientes en ~13 dias.
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       cooldown:
@@ -73,123 +57,139 @@ on:
           - "carriers ucc_filings maestro"
 
 concurrency:
+  # Dos runs a la vez se pisarian el movik.db y el checkpoint.
   group: scraper-ca
   cancel-in-progress: false
 
+# actions:read para que `gh run download` vea el artifact del run anterior; el
+# GITHUB_TOKEN por defecto no llega a la API de Actions y responde 403.
 permissions:
   contents: read
+  actions: read
 
 env:
-  # Fuera del workspace: `checkout` limpia el suyo y se llevaria el estado por
-  # delante. Ruta absoluta y fuera de C:\Users para que funcione sea cual sea la
-  # cuenta con la que corra el servicio del runner.
-  ESTADO: C:\movik-state\ca
+  ESTADO_ENC: movik-state-ca.gz.enc
 
 jobs:
   scrape:
-    runs-on: [self-hosted, movik-ca]
-    # En self-hosted no hay limite de 6 h de GitHub, y quien corta de verdad es
-    # el WAF. Esto solo evita un run colgado para siempre.
-    timeout-minutes: 600
-
-    # -ExecutionPolicy Bypass, o el job no arranca. El runner escribe cada paso
-    # a un .ps1 en _temp y lo invoca con dot-sourcing; en esta maquina la
-    # directiva de LocalMachine esta Undefined —o sea Restricted— y cargar ese
-    # archivo da "running scripts is disabled on this system". El usuario tiene
-    # RemoteSigned, pero eso solo vale si el servicio corre con SU cuenta.
-    # Bypass aqui lo hace independiente de la cuenta y no cambia nada global,
-    # que es preferible a un Set-ExecutionPolicy con admin sobre la maquina.
-    defaults:
-      run:
-        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
 
-      # Falla temprano y diciendo por que. Si el servicio del runner corre como
-      # NETWORK SERVICE no ve el Python instalado por usuario, y sin esto el
-      # error aparece tres pasos mas abajo disfrazado de otra cosa.
-      - name: Comprobar Python
-        run: |
-          $py = Get-Command python -ErrorAction SilentlyContinue
-          if (-not $py) {
-            Write-Output "::error::python no esta en el PATH de la cuenta del runner ($env:USERNAME). Python esta instalado por usuario; configura el servicio del runner para que corra como ese usuario, o instala Python para todos los usuarios."
-            exit 1
-          }
-          Write-Output "python: $($py.Source)"
-          python --version
-          Write-Output "cuenta del runner: $env:USERDOMAIN\$env:USERNAME"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # El estado persiste en el disco del runner: son 300 MB y subirlos y
-      # bajarlos como artifact en cada pasada es tiempo tirado. El directorio se
-      # siembra una vez (copiando un movik.db al dia) y de ahi en adelante lo
-      # mantiene el paso de guardado.
-      - name: Recuperar movik.db del disco del runner
+      # Sin la clave el run no puede ni leer el estado ni guardarlo, y sin este
+      # corte el fallo aparece a mitad de camino disfrazado de "movik.db
+      # corrupto". Se comprueba que existe, nunca se imprime.
+      - name: Comprobar STATE_KEY
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          if (-not (Test-Path "$env:ESTADO\movik.db")) {
-            Write-Output "::error::No hay movik.db en $env:ESTADO. Siembra el directorio copiando alli un movik.db al dia (o corre seed_db.sh)."
+          if [ -z "$STATE_KEY" ]; then
+            echo "::error::Falta el secret STATE_KEY. Settings → Secrets and variables → Actions."
             exit 1
-          }
-          Copy-Item "$env:ESTADO\movik.db" movik.db -Force
-          $ck = "$env:ESTADO\ca_scraper_checkpoint.json"
-          if (Test-Path $ck) { Copy-Item $ck ca_scraper_checkpoint.json -Force }
-          Write-Output "Estado restaurado de $env:ESTADO"
-          Get-Item movik.db | Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table
+          fi
+          echo "STATE_KEY presente (${#STATE_KEY} caracteres)"
 
-      # Sin esto el scraper arranca contra una IP todavia marcada y lo unico que
-      # consigue es refrescar la marca. Sale 1 si tras 6 h sigue bloqueada: ahi
-      # el problema ya no es transitorio y hace falta rotar IP.
+      - name: Recuperar y descifrar movik.db
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          # || true porque el paso corre con `bash -e`: si gh falla, la
+          # asignacion falla y el paso muere antes de intentar el release.
+          PREV=$(gh run list --workflow=scraper_ca.yml --status=success \
+                   --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
+          if [ -n "$PREV" ] && gh run download "$PREV" --name movik-state-ca --dir .; then
+            echo "Estado restaurado del run $PREV"
+          else
+            echo "Sin artifact previo; bajando la semilla cifrada del release db-seed"
+            gh release download db-seed --pattern "$ESTADO_ENC" --clobber
+          fi
+
+          if [ ! -f "$ESTADO_ENC" ]; then
+            echo "::error::No hay estado cifrado ni semilla. Sube $ESTADO_ENC al release db-seed."
+            exit 1
+          fi
+
+          # -pass env: y no -pass pass:, que dejaria la clave en la linea de
+          # comandos y por tanto en la lista de procesos del runner.
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$ESTADO_ENC" -pass env:STATE_KEY | gunzip > movik.db
+          rm -f "$ESTADO_ENC"
+          ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
+
+      # Cada run trae IP nueva, asi que esto deberia pasar a la primera. Se deja
+      # igualmente: si GitHub reasigna una IP ya quemada, mejor esperar que
+      # gastar la pasada contra un 403.
       - name: Esperar via libre del portal
         id: probe
-        run: |
-          $cd = if ("${{ inputs.cooldown }}") { "${{ inputs.cooldown }}" } else { "0" }
-          python -u ca_resume.py --probe-only --cooldown $cd
+        run: python -u ca_resume.py --probe-only --cooldown "${{ inputs.cooldown || '0' }}"
 
+      # timeout en el PASO, no solo en el job: si el job se cancela por su propio
+      # timeout, los pasos siguientes no corren y lo scrapeado se queda encerrado
+      # sin llegar a Supabase. continue-on-error porque el corte del WAF es el
+      # final normal de una pasada, no un fallo.
       - name: Correr scraper CA
         id: scrape
+        timeout-minutes: 320
         continue-on-error: true
         run: |
-          $a = @()
-          if ("${{ inputs.workers }}") { $a += @("--workers", "${{ inputs.workers }}") }
-          if ("${{ inputs.rate }}")    { $a += @("--rate",    "${{ inputs.rate }}") }
-          if ("${{ inputs.retry_errors }}" -eq "true") { $a += "--retry-errors" }
-          Write-Output "python ca_ucc_scraper.py $a"
-          python -u ca_ucc_scraper.py @a
+          ARGS=""
+          if [ -n "${{ inputs.workers }}" ]; then ARGS="$ARGS --workers ${{ inputs.workers }}"; fi
+          if [ -n "${{ inputs.rate }}" ]; then ARGS="$ARGS --rate ${{ inputs.rate }}"; fi
+          if [ "${{ inputs.retry_errors }}" = "true" ]; then ARGS="$ARGS --retry-errors"; fi
+          echo "python ca_ucc_scraper.py $ARGS"
+          python -u ca_ucc_scraper.py $ARGS
 
-      # Antes de cargar: si esto no corre, la pasada se pierde entera.
-      - name: Guardar estado en el disco del runner
-        if: always()
+      - name: Cifrar el estado
+        if: always() && hashFiles('movik.db') != ''
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          if (-not (Test-Path movik.db)) { Write-Output "Sin movik.db, nada que guardar"; exit 0 }
-          New-Item -ItemType Directory -Force -Path $env:ESTADO | Out-Null
-          Copy-Item movik.db "$env:ESTADO\movik.db" -Force
-          if (Test-Path ca_scraper_checkpoint.json) {
-            Copy-Item ca_scraper_checkpoint.json "$env:ESTADO\ca_scraper_checkpoint.json" -Force
-          }
-          Get-ChildItem $env:ESTADO | Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table
+          gzip -c movik.db \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+                -out "$ESTADO_ENC" -pass env:STATE_KEY
+          ls -lh "$ESTADO_ENC"
 
-      # --state CA es obligatorio: este movik.db es el fork de CA y no tiene lo
-      # que el workflow de FL haya scrapeado en el suyo. Sin acotar, el
-      # reemplazo borraria de Supabase todo el avance de FL.
+      # El checkpoint va en claro a proposito: son contadores de la pasada
+      # (cuantos, cuantas requests, donde corto el WAF), sin datos de carriers.
+      - name: Guardar estado cifrado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: movik-state-ca
+          path: |
+            movik-state-ca.gz.enc
+            ca_scraper_checkpoint.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      # always(): lo scrapeado hasta el corte del WAF vale igual, y si esto no
+      # corre se queda encerrado en el artifact. Es lo que hace que la webapp
+      # vea el avance de cada pasada.
+      # --state CA acota el reemplazo: este movik.db es el fork de CA y no tiene
+      # lo que FL haya scrapeado en el suyo. Sin acotar, borraria FL de Supabase.
       - name: Cargar a Supabase (schema movik)
         if: always() && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: |
-          $t = if ("${{ inputs.tables }}") { "${{ inputs.tables }}" } else { "ucc_filings maestro" }
-          python -u load_to_supabase.py --state CA --only $t.Split(" ")
+        run: python -u load_to_supabase.py --state CA --only ${{ inputs.tables || 'ucc_filings maestro' }}
 
       - name: Resumen
         if: always()
         run: |
-          "### Scraper CA"                            | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          "- sondeo:  ``${{ steps.probe.outcome }}``"  | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          "- scraper: ``${{ steps.scrape.outcome }}``" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          python ca_progress.py | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          echo "### Scraper CA" >> $GITHUB_STEP_SUMMARY
+          echo "- sondeo:  \`${{ steps.probe.outcome }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- scraper: \`${{ steps.scrape.outcome }}\`" >> $GITHUB_STEP_SUMMARY
+          python ca_progress.py >> $GITHUB_STEP_SUMMARY
