@@ -62,6 +62,13 @@ def main():
     # en vez de perderlos en un Popen que nadie espera.
     ap.add_argument("--probe-only", action="store_true",
                     help="Solo esperar via libre y salir; no lanza el scraper")
+    # En GitHub Actions esperar sale carisimo: el sondeo de la primera corrida
+    # se comio 160 de los ~350 min del run. Y como cada run trae runner nuevo,
+    # rendirse pronto y dejar que lo intente el siguiente es mas barato que
+    # aguantar horas contra una IP que quiza no ceda.
+    ap.add_argument("--max-wait", type=int, default=MAX_WAIT_MIN, metavar="M",
+                    help=f"Minutos maximos de sondeo antes de rendirse "
+                         f"(default {MAX_WAIT_MIN})")
     a = ap.parse_args()
 
     emit(f"[RESUME] enfriamiento de {a.cooldown} min antes del primer sondeo")
@@ -74,10 +81,13 @@ def main():
             emit(f"[RESUME] portal responde 200 tras {waited} min - reanudando")
             break
         emit(f"[RESUME] sondeo: HTTP {st} - sigue bloqueado ({waited} min esperados)")
-        if waited >= MAX_WAIT_MIN:
-            emit(f"[ALERTA] {MAX_WAIT_MIN} min bloqueados: no es transitorio. "
-                 f"La IP sigue marcada -> hace falta rotar IP (proxies).")
-            sys.exit(1 if a.probe_only else 0)
+        if waited >= a.max_wait:
+            emit(f"[BLOQUEADO] {a.max_wait} min sin via libre. Esta IP no sirve.")
+            # 2, no 1: "esta IP esta bloqueada" no es un error del programa. El
+            # workflow lo distingue para terminar el run en limpio y dejar que
+            # el siguiente lo intente con otro runner, en vez de pintarse de
+            # rojo o de gastar el presupuesto entero esperando.
+            sys.exit(2 if a.probe_only else 0)
         time.sleep(PROBE_EVERY_MIN * 60)
         waited += PROBE_EVERY_MIN
 

@@ -26,10 +26,11 @@ name: Scraper CA
 
 on:
   schedule:
-    # Cada 3 h. Una pasada dura ~2,3 h (la corta el WAF cerca de la request
-    # ~3.000), asi que 3 h es lo mas apretado que se puede sin solaparse.
-    # 8 pasadas/dia x ~3.000 = ~24.000/dia -> los 316.580 pendientes en ~13 dias.
-    - cron: "0 */3 * * *"
+    # Cada 6 h, no 3. Un run puede llegar a 30 min de sondeo + 320 de scraping
+    # (~5,8 h), y con 3 h se solapaban: el siguiente cancelaba al encolado y en
+    # 10 corridas no se scrapeo ni un carrier. El grupo de concurrencia protege
+    # el estado, pero solo si el cron deja terminar al que corre.
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       cooldown:
@@ -129,12 +130,30 @@ jobs:
           rm -f "$ESTADO_ENC"
           ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
 
-      # Cada run trae IP nueva, asi que esto deberia pasar a la primera. Se deja
-      # igualmente: si GitHub reasigna una IP ya quemada, mejor esperar que
-      # gastar la pasada contra un 403.
+      # Acotado a 30 min. La primera corrida gasto 160 de los ~350 min del run
+      # sondeando, y aun asi el cron de 3 h hacia que el siguiente run cancelara
+      # a este en cola: 10 corridas seguidas sin scrapear un solo carrier.
+      # Rendirse pronto y dejar que lo intente el siguiente runner —con IP
+      # distinta— es mas barato que aguantar horas contra una IP que quiza no
+      # ceda nunca. Salida 2 = bloqueado (no es fallo); el resto del job se
+      # salta y el run termina en limpio.
       - name: Esperar via libre del portal
         id: probe
-        run: python -u ca_resume.py --probe-only --cooldown "${{ inputs.cooldown || '0' }}"
+        run: |
+          set +e
+          python -u ca_resume.py --probe-only \
+            --cooldown "${{ inputs.cooldown || '0' }}" --max-wait 30
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "libre=true" >> $GITHUB_OUTPUT
+          elif [ $rc -eq 2 ]; then
+            echo "libre=false" >> $GITHUB_OUTPUT
+            echo "::notice::IP bloqueada tras 30 min. Se salta esta pasada; lo reintenta el siguiente run."
+          else
+            echo "::error::ca_resume.py fallo con codigo $rc"
+            exit $rc
+          fi
 
       # timeout en el PASO, no solo en el job: si el job se cancela por su propio
       # timeout, los pasos siguientes no corren y lo scrapeado se queda encerrado
@@ -142,6 +161,7 @@ jobs:
       # final normal de una pasada, no un fallo.
       - name: Correr scraper CA
         id: scrape
+        if: steps.probe.outputs.libre == 'true'
         timeout-minutes: 320
         continue-on-error: true
         run: |
@@ -161,7 +181,7 @@ jobs:
       # La distincion que importa no es exito/fallo sino si la pasada AVANZO.
       # Si el scraper murio sin procesar a nadie, esto para el job en rojo.
       - name: Comprobar que la pasada avanzo
-        if: always()
+        if: always() && steps.probe.outputs.libre == 'true'
         run: |
           if [ ! -f ca_scraper_checkpoint.json ]; then
             echo "::error::El scraper no dejo checkpoint: murio antes de empezar. Outcome: ${{ steps.scrape.outcome }}"
@@ -179,7 +199,7 @@ jobs:
           PY
 
       - name: Cifrar el estado
-        if: always() && hashFiles('movik.db') != ''
+        if: always() && steps.probe.outputs.libre == 'true' && hashFiles('movik.db') != ''
         env:
           STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
@@ -191,7 +211,7 @@ jobs:
       # El checkpoint va en claro a proposito: son contadores de la pasada
       # (cuantos, cuantas requests, donde corto el WAF), sin datos de carriers.
       - name: Guardar estado cifrado
-        if: always()
+        if: always() && steps.probe.outputs.libre == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: movik-state-ca
@@ -207,7 +227,7 @@ jobs:
       # --state CA acota el reemplazo: este movik.db es el fork de CA y no tiene
       # lo que FL haya scrapeado en el suyo. Sin acotar, borraria FL de Supabase.
       - name: Cargar a Supabase (schema movik)
-        if: always() && hashFiles('movik.db') != ''
+        if: always() && steps.probe.outputs.libre == 'true' && hashFiles('movik.db') != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python -u load_to_supabase.py --state CA --only ${{ inputs.tables || 'ucc_filings maestro' }}
