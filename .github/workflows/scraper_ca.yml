@@ -26,10 +26,10 @@ name: Scraper CA
 
 on:
   schedule:
-    # Cada 6 h, no 3. Un run puede llegar a 30 min de sondeo + 320 de scraping
-    # (~5,8 h), y con 3 h se solapaban: el siguiente cancelaba al encolado y en
-    # 10 corridas no se scrapeo ni un carrier. El grupo de concurrencia protege
-    # el estado, pero solo si el cron deja terminar al que corre.
+    # Cada 6 h, no 3. Un run puede agotar sus 350 min de tope, y con 3 h se
+    # solapaban: el siguiente cancelaba al encolado y en 10 corridas no se
+    # scrapeo ni un carrier. El grupo de concurrencia protege el estado, pero
+    # solo si el cron deja terminar al que corre.
     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
@@ -130,26 +130,47 @@ jobs:
           rm -f "$ESTADO_ENC"
           ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
 
-      # Acotado a 30 min. La primera corrida gasto 160 de los ~350 min del run
-      # sondeando, y aun asi el cron de 3 h hacia que el siguiente run cancelara
-      # a este en cola: 10 corridas seguidas sin scrapear un solo carrier.
-      # Rendirse pronto y dejar que lo intente el siguiente runner —con IP
-      # distinta— es mas barato que aguantar horas contra una IP que quiza no
-      # ceda nunca. Salida 2 = bloqueado (no es fallo); el resto del job se
-      # salta y el run termina en limpio.
+      # 180 min de tope, elegido con los dos unicos datos que hay:
+      #
+      #   run 31184677242 — 160 min de 403 y entonces 200. Paso.
+      #   run 31274273405 — tope de 30 min. Saltado.
+      #
+      # O sea que el portal cede por TIEMPO, no por identidad: el unico run que
+      # ha entrado necesito 160 min de sondeo a 1 request cada 10. Un tope de 30
+      # habria saltado tambien ese, y probablemente no pasaria ninguno nunca.
+      #
+      # 180 deja ~170 min de scraping dentro del tope de 350 del job, suficiente
+      # para los ~3.000 carriers que el WAF permite por pasada. El tope importa
+      # igual: sin el, el sondeo se comia el run entero y no quedaba presupuesto
+      # para scrapear.
+      #
+      # Salida 2 = bloqueado (no es fallo del programa); el resto del job se
+      # salta y el run termina en limpio para que lo reintente el siguiente.
       - name: Esperar via libre del portal
         id: probe
         run: |
+          t0=$SECONDS
           set +e
           python -u ca_resume.py --probe-only \
-            --cooldown "${{ inputs.cooldown || '0' }}" --max-wait 30
+            --cooldown "${{ inputs.cooldown || '0' }}" --max-wait 180
           rc=$?
           set -e
+          # El scraper no puede llevarse un tope fijo: 180 de sondeo + 320 de
+          # scraping se pasan de los 350 del job, y cuando expira el JOB los
+          # pasos siguientes no corren — asi se perdio una vez la carga de
+          # 28.385 carriers, que se quedaron encerrados en el artifact. Se
+          # reparte lo que de verdad queda: 350 menos lo gastado (mas ~10 de
+          # checkout, deps y descifrado), menos ~25 para cifrar, subir y cargar.
+          gastado=$(( (SECONDS - t0) / 60 + 10 ))
+          restante=$(( 350 - gastado - 25 ))
+          [ $restante -lt 10 ] && restante=10
+          echo "restante=$restante" >> $GITHUB_OUTPUT
+          echo "sondeo: ${gastado} min gastados; quedan ${restante} min para scrapear"
           if [ $rc -eq 0 ]; then
             echo "libre=true" >> $GITHUB_OUTPUT
           elif [ $rc -eq 2 ]; then
             echo "libre=false" >> $GITHUB_OUTPUT
-            echo "::notice::IP bloqueada tras 30 min. Se salta esta pasada; lo reintenta el siguiente run."
+            echo "::notice::IP bloqueada tras 180 min. Se salta esta pasada; lo reintenta el siguiente run."
           else
             echo "::error::ca_resume.py fallo con codigo $rc"
             exit $rc
@@ -162,7 +183,7 @@ jobs:
       - name: Correr scraper CA
         id: scrape
         if: steps.probe.outputs.libre == 'true'
-        timeout-minutes: 320
+        timeout-minutes: ${{ steps.probe.outputs.restante }}
         continue-on-error: true
         run: |
           ARGS=""
