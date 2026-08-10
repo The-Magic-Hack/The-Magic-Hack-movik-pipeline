@@ -389,7 +389,7 @@ def state_scope_sql(table: str, state: str) -> tuple[str, tuple]:
 
 
 def load_swap(conn, table: str, cols: list[str], rows: list[dict],
-              state: str | None = None) -> None:
+              state: str | None = None, pk: str | None = None) -> None:
     """
     Carga a una tabla de staging y traslada el contenido a la definitiva al
     final, sin que la webapp vea nunca una tabla vacía.
@@ -445,7 +445,8 @@ def load_swap(conn, table: str, cols: list[str], rows: list[dict],
         else:
             cur.execute(f"TRUNCATE {SCHEMA}.{table}")
         cur.execute(f"INSERT INTO {SCHEMA}.{table} ({col_list}) "
-                    f"SELECT {col_list} FROM {SCHEMA}.{tmp}")
+                    f"SELECT {col_list} FROM {SCHEMA}.{tmp}"
+                    + (f' ON CONFLICT ("{pk}") DO NOTHING' if pk else ""))
         movidas = cur.rowcount
     conn.commit()
     with conn.cursor() as cur:
@@ -733,7 +734,7 @@ def main():
         if args.upsert:
             push(pg, table, cols, rows, pk, args.batch, args.dry_run)
         else:
-            load_swap(pg, table, cols, rows, state)
+            load_swap(pg, table, cols, rows, state, pk)
 
     try:
         if "carriers" in targets:
