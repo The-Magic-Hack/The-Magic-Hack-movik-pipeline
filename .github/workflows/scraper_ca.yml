@@ -130,19 +130,28 @@ jobs:
           rm -f "$ESTADO_ENC"
           ls -lh movik.db ca_scraper_checkpoint.json 2>/dev/null || true
 
-      # 180 min de tope, elegido con los dos unicos datos que hay:
+      # 15 min de tope. Antes eran 180, apostando a que "el portal cede por
+      # TIEMPO, no por identidad" — deducido de un unico run (31184677242) que
+      # entro tras 160 min de sondeo. Ese run era ruido, y encima scrapeo cero
+      # porque murio en el bug del xlsx.
       #
-      #   run 31184677242 — 160 min de 403 y entonces 200. Paso.
-      #   run 31274273405 — tope de 30 min. Saltado.
+      # LO QUE DICEN LOS DATOS (medido el 13/08/2026)
+      # --------------------------------------------
+      # 21 runs seguidos, ~384 sondeos, HTTP 403 en TODOS sin una excepcion. Y
+      # el 403 llega en el request numero 1, con la IP recien estrenada: no hay
+      # reputacion que reconstruir ni volumen acumulado que purgar. Incapsula
+      # bloquea los rangos de datacenter de Azure/GitHub en bloque.
       #
-      # O sea que el portal cede por TIEMPO, no por identidad: el unico run que
-      # ha entrado necesito 160 min de sondeo a 1 request cada 10. Un tope de 30
-      # habria saltado tambien ese, y probablemente no pasaria ninguno nunca.
+      # Contraste que lo confirma: desde una IP residencial el primer GET
+      # devuelve 200. Misma request, mismo codigo, mismo user-agent.
       #
-      # 180 deja ~170 min de scraping dentro del tope de 350 del job, suficiente
-      # para los ~3.000 carriers que el WAF permite por pasada. El tope importa
-      # igual: sin el, el sondeo se comia el run entero y no quedaba presupuesto
-      # para scrapear.
+      # Una espera no levanta un bloqueo por ASN — es imposible por
+      # construccion. Sondear 180 min solo quemaba ~12 h de runner al dia para
+      # saltarse la pasada igual. Con 15 min el run bloqueado muere en ~2 min y
+      # el siguiente prueba con otra IP, que es la unica variable que importa.
+      #
+      # Si alguna vez vuelve a pasar, `restante` reparte el presupuesto solo y
+      # quedan ~300 min de scraping, mas que los ~170 de antes.
       #
       # Salida 2 = bloqueado (no es fallo del programa); el resto del job se
       # salta y el run termina en limpio para que lo reintente el siguiente.
@@ -152,10 +161,10 @@ jobs:
           t0=$SECONDS
           set +e
           python -u ca_resume.py --probe-only \
-            --cooldown "${{ inputs.cooldown || '0' }}" --max-wait 180
+            --cooldown "${{ inputs.cooldown || '0' }}" --max-wait 15
           rc=$?
           set -e
-          # El scraper no puede llevarse un tope fijo: 180 de sondeo + 320 de
+          # El scraper no puede llevarse un tope fijo: el sondeo mas 320 de
           # scraping se pasan de los 350 del job, y cuando expira el JOB los
           # pasos siguientes no corren — asi se perdio una vez la carga de
           # 28.385 carriers, que se quedaron encerrados en el artifact. Se
@@ -170,7 +179,7 @@ jobs:
             echo "libre=true" >> $GITHUB_OUTPUT
           elif [ $rc -eq 2 ]; then
             echo "libre=false" >> $GITHUB_OUTPUT
-            echo "::notice::IP bloqueada tras 180 min. Se salta esta pasada; lo reintenta el siguiente run."
+            echo "::notice::IP bloqueada tras 15 min. Se salta esta pasada; lo reintenta el siguiente run."
           else
             echo "::error::ca_resume.py fallo con codigo $rc"
             exit $rc
