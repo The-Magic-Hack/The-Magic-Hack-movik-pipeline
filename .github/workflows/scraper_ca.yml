@@ -135,20 +135,29 @@ jobs:
       # entro tras 160 min de sondeo. Ese run era ruido, y encima scrapeo cero
       # porque murio en el bug del xlsx.
       #
-      # LO QUE DICEN LOS DATOS (medido el 13/08/2026)
-      # --------------------------------------------
-      # 21 runs seguidos, ~384 sondeos, HTTP 403 en TODOS sin una excepcion. Y
-      # el 403 llega en el request numero 1, con la IP recien estrenada: no hay
-      # reputacion que reconstruir ni volumen acumulado que purgar. Incapsula
-      # bloquea los rangos de datacenter de Azure/GitHub en bloque.
+      # LO QUE DICEN LOS DATOS (medido el 13-14/08/2026)
+      # ------------------------------------------------
+      # 21 runs seguidos, ~384 sondeos, HTTP 403 en TODOS sin una excepcion.
       #
-      # Contraste que lo confirma: desde una IP residencial el primer GET
-      # devuelve 200. Misma request, mismo codigo, mismo user-agent.
+      # No es la IP. El portal monto Imperva Advanced Bot Protection: la pagina
+      # carga /ixt-the-Quarthy-Snard-a-Sept-tis-to-their-cert-a, que resuelve una
+      # "interrogation" y deja el token en la cookie reese84. Sin ese token el
+      # POST a /api/Records/uccsearch es 403 venga de donde venga. Medido:
       #
-      # Una espera no levanta un bloqueo por ASN — es imposible por
-      # construccion. Sondear 180 min solo quemaba ~12 h de runner al dia para
-      # saltarse la pasada igual. Con 15 min el run bloqueado muere en ~2 min y
-      # el siguiente prueba con otra IP, que es la unica variable que importa.
+      #   IP residencial limpia  →  GET 200, POST 403
+      #   8 circuitos de Tor     →  GET 200 en 5/8, POST 403 en 8/8
+      #
+      # En julio esa capa no estaba, y por eso el scraper funcionaba.
+      #
+      # OJO AL LEER LOS 403 DE ESTE PASO: ca_resume.py:probe() hace GET y luego
+      # POST, pero devuelve el status del POST. Esos ~384 "403" no dicen nada
+      # sobre si la IP del runner puede cargar la pagina. Confundirlos llevo a
+      # concluir que era un bloqueo por ASN de Azure/GitHub; era falso.
+      #
+      # Con todo, sondear 180 min sigue sin tener sentido: ninguna espera fabrica
+      # un token. Solo quemaba ~12 h de runner al dia para saltarse la pasada
+      # igual. Con 15 min el run bloqueado muere en ~2 min. El sondeo se queda
+      # como billete de loteria barato mientras se valida la via del reese84.
       #
       # Si alguna vez vuelve a pasar, `restante` reparte el presupuesto solo y
       # quedan ~300 min de scraping, mas que los ~170 de antes.
